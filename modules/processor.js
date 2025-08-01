@@ -8,6 +8,12 @@ import logger from '../utils/logger.js';
 import { createSafeArticleFilename } from '../utils/helpers.js';
 import { extractArticleContent, callLLM } from '../services/network.js';
 
+/**
+ * 安全地解析从LLM返回的JSON响应。
+ * @param {string} llmResponse - LLM的原始响应文本
+ * @returns {object} - 经过验证的、包含所需字段的JSON对象
+ * @throws 如果解析失败或缺少关键字段，则抛出错误
+ */
 function robustParseLLMResponse(llmResponse) {
     const jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
@@ -42,12 +48,14 @@ function robustParseLLMResponse(llmResponse) {
     return { title: newTitle, conciseSummary: finalConciseSummary, keywords: finalKeywords, category: finalCategory, detailedSummary: detailedSummary.trim() };
 }
 
-
-async function processSingleArticle(articleMeta, progressCallback = () => {}) {
-    const { title: originalTitle, content, url, isCluster } = articleMeta;
+/**
+ * 内部函数，处理单次LLM调用和解析。
+ * @param {object} articleContent - 包含内容和原始标题的对象
+ * @returns {Promise<object>} - 处理后的数据
+ */
+async function processArticleWithLLM(articleContent, originalTitle, isCluster) {
     logger.debug(`开始处理议题: 《${originalTitle}》`);
-    progressCallback(`深度处理中`);
-    const { system, user } = CONFIG.prompts.processArticleSingleCall(content, originalTitle, isCluster);
+    const { system, user } = CONFIG.prompts.processArticleSingleCall(articleContent, originalTitle, isCluster);
     const llmResponse = await callLLM(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
         0.5,
@@ -72,119 +80,83 @@ async function processSingleArticle(articleMeta, progressCallback = () => {}) {
     if (!processedData.title || !processedData.detailedSummary) throw new Error('经过解析和验证后，响应中仍缺少必要的标题或详细摘要。');
     if (!processedData.conciseSummary) logger.warn(`议题《${originalTitle}》最终未能生成有效的一句话摘要。`);
 
-    logger.info(`议题《${originalTitle}》处理成功，新标题为《${processedData.title}》！`);
+    logger.info(`议题《${originalTitle}》LLM处理成功，新标题为《${processedData.title}》！`);
     return processedData;
 }
 
 
 /**
- * (已重构) 串行处理入选的文章议题，计算时间加权分，并保存独立报告。
+ * (已重构) 尝试处理单篇文章议题，内置重试逻辑。
+ * 如果在所有尝试后仍然失败，将抛出错误，由主流程捕获。
+ * @param {object} articleMeta - 从排名模块传入的单篇文章元数据
+ * @param {number} rankIndex - 该文章在最终成功列表中的排名索引，用于生成文件名
+ * @param {string} dailyOutputDir - 当日输出目录
+ * @returns {Promise<object>} - 包含所有处理后数据的完整文章对象
+ * @throws 如果所有重试都失败，则抛出错误
  */
-export async function processAndSummarizeArticles(articles, dailyOutputDir, progressBar) {
-    if (articles.length === 0) {
-        logger.info('没有需要处理的文章。');
-        return [];
-    }
-
+export async function attemptToProcessArticle(articleMeta, rankIndex, dailyOutputDir) {
     const individualArticlesDir = path.join(dailyOutputDir, 'articles_markdown');
     await fs.mkdir(individualArticlesDir, { recursive: true });
-    logger.info(`单篇文章/议题的 Markdown 报告将保存在: ${individualArticlesDir}`);
 
-    let processingQueue = [...articles];
-    const successfulArticles = [];
-    const failedArticles = new Map();
-    let overallRetryCount = 0;
+    for (let attempt = 1; attempt <= CONFIG.processing.maxOverallRetries; attempt++) {
+        try {
+            // 1. 提取原文内容
+            const isCluster = articleMeta.clusterUrls && articleMeta.clusterUrls.length > 1;
+            const urlsToFetch = isCluster ? articleMeta.clusterUrls : [articleMeta.url];
+            let combinedContent = '';
+            let contentCount = 0;
+            let latestDate = null;
 
-    while (processingQueue.length > 0 && overallRetryCount < CONFIG.processing.maxOverallRetries) {
-        if (overallRetryCount > 0) {
-            console.log(chalk.yellow.bold(`\n--- 开始第 ${overallRetryCount} 轮失败重试 (${processingQueue.length}篇) ---`));
-            const delay = CONFIG.llm.retryDelay * Math.pow(2, overallRetryCount - 1);
-            console.log(chalk.gray(`(等待 ${delay / 1000} 秒后重试...)`));
-            await new Promise(res => setTimeout(res, delay));
-        }
+            for (const [subIndex, url] of urlsToFetch.entries()) {
+                const { title: articleTitle, content, date_published } = await extractArticleContent(url);
+                
+                if (date_published) {
+                    const articleDate = new Date(date_published);
+                    if (!latestDate || articleDate > latestDate) latestDate = articleDate;
+                }
 
-        const currentBatch = [...processingQueue];
-        processingQueue = [];
+                if (content.length > CONFIG.processing.minContentLength / urlsToFetch.length) {
+                    combinedContent += isCluster 
+                        ? `--- [相关文章 ${subIndex + 1}/${urlsToFetch.length}] 原始标题: ${articleTitle} ---\n\n${content}\n\n`
+                        : content;
+                    contentCount++;
+                }
+            }
 
-        for (const [index, meta] of currentBatch.entries()) {
-            const shortTitle = (meta.title || '未知标题').slice(0, 35);
-            progressBar.setTotal(currentBatch.length);
-            progressBar.update(index, { status: `[提取原文] ${shortTitle}...` });
+            if (contentCount === 0) throw new Error('所有源文章的正文内容均过短, 已跳过');
+
+            // 2. 调用LLM进行深度处理
+            const processedData = await processArticleWithLLM(combinedContent, articleMeta.title, isCluster);
+
+            // 3. 计算新颖度加分和最终得分
+            let recencyBonus = 0;
+            if (latestDate) {
+                const daysAgo = (new Date() - latestDate) / (1000 * 60 * 60 * 24);
+                if (daysAgo >= 0 && daysAgo <= CONFIG.processing.recencyBonus.maxDays) {
+                    recencyBonus = Math.round(CONFIG.processing.recencyBonus.maxBonus * (1 - (daysAgo / CONFIG.processing.recencyBonus.maxDays)));
+                }
+            }
+            const finalScore = (articleMeta.tournamentScore || 0) + recencyBonus;
+            logger.info(`议题《${processedData.title}》 - 锦标赛得分: ${articleMeta.tournamentScore}, 新颖度加分: ${recencyBonus}, 最终得分: ${finalScore}`);
+
+            // 4. 整合最终结果对象
+            const finalResult = { 
+                ...articleMeta, 
+                ...processedData,
+                publishedDate: latestDate ? latestDate.toISOString().slice(0, 10) : null,
+                recencyBonus,
+                finalScore
+            };
+
+            // 5. 生成并保存独立的Markdown文件
+            const safeFilename = createSafeArticleFilename(rankIndex, finalResult.title);
+            const articleFilePath = path.join(individualArticlesDir, safeFilename);
             
-            try {
-                const isCluster = meta.clusterUrls && meta.clusterUrls.length > 1;
-                const urlsToFetch = meta.clusterUrls || [meta.url];
-                let combinedContent = '';
-                let contentCount = 0;
-                let latestDate = null;
+            const sourceLinks = isCluster
+                ? finalResult.clusterUrls.map((u, i) => `- [${finalResult.clusterTitles[i]}](${u})`).join('\n')
+                : `[${finalResult.originalTitle}](${finalResult.url})`;
 
-                for (const [subIndex, url] of urlsToFetch.entries()) {
-                    const { title: articleTitle, content, date_published } = await extractArticleContent(url);
-                    
-                    // 更新为最近的发布日期
-                    if (date_published) {
-                        const articleDate = new Date(date_published);
-                        if (!latestDate || articleDate > latestDate) {
-                            latestDate = articleDate;
-                        }
-                    }
-
-                    if (content.length > CONFIG.processing.minContentLength / urlsToFetch.length) {
-                        if(isCluster) {
-                            combinedContent += `--- [相关文章 ${subIndex + 1}/${urlsToFetch.length}] 原始标题: ${articleTitle} ---\n\n${content}\n\n`;
-                        } else {
-                            combinedContent += content;
-                        }
-                        contentCount++;
-                    }
-                }
-
-                if (contentCount === 0) {
-                    throw new Error(`正文内容均过短, 已跳过。`);
-                }
-                
-                const articleDataForLLM = { 
-                    title: meta.title, 
-                    content: combinedContent, 
-                    url: meta.url,
-                    isCluster: isCluster 
-                };
-
-                const processedData = await processSingleArticle(articleDataForLLM, (taskName) => {
-                    progressBar.update(index, { status: `[${taskName}] ${shortTitle}...` });
-                });
-
-                const safeFilename = createSafeArticleFilename(meta.rank - 1, processedData.title);
-                const articleFilePath = path.join(individualArticlesDir, safeFilename);
-                
-                // --- (新增) 计算新颖度得分 ---
-                let recencyBonus = 0;
-                if (latestDate) {
-                    const daysAgo = (new Date() - latestDate) / (1000 * 60 * 60 * 24);
-                    if (daysAgo >= 0 && daysAgo <= CONFIG.processing.recencyBonus.maxDays) {
-                        recencyBonus = Math.round(CONFIG.processing.recencyBonus.maxBonus * (1 - (daysAgo / CONFIG.processing.recencyBonus.maxDays)));
-                    }
-                }
-
-                const finalScore = (meta.tournamentScore || 0) + recencyBonus;
-                logger.info(`议题《${processedData.title}》 - 锦标赛得分: ${meta.tournamentScore}, 新颖度加分: ${recencyBonus}, 最终得分: ${finalScore}`);
-                
-                const finalResult = { 
-                    ...meta, 
-                    ...processedData,
-                    publishedDate: latestDate ? latestDate.toISOString().slice(0, 10) : null,
-                    recencyBonus: recencyBonus,
-                    finalScore: finalScore
-                };
-                
-                let sourceLinks = '';
-                if(isCluster) {
-                    sourceLinks = finalResult.clusterUrls.map((u, i) => `- [${finalResult.clusterTitles[i]}](${u})`).join('\n');
-                } else {
-                    sourceLinks = `[${finalResult.originalTitle}](${finalResult.url})`;
-                }
-
-                const articleMarkdown = `
+            const articleMarkdown = `
 # ${finalResult.title}
 - **一句话摘要**: ${finalResult.conciseSummary || 'N/A'}
 - **核心词**: ${finalResult.keywords.join('、') || 'N/A'}
@@ -203,32 +175,21 @@ ${finalResult.detailedSummary}
 *原始代表标题: ${finalResult.originalTitle}*
 `.trim();
 
-                await fs.writeFile(articleFilePath, articleMarkdown);
-                logger.info(`[处理成功] ${safeFilename}`);
+            await fs.writeFile(articleFilePath, articleMarkdown);
+            logger.info(`[处理成功] ${safeFilename}`);
+            
+            // 成功，返回完整结果
+            return finalResult;
 
-                successfulArticles.push(finalResult);
-                progressBar.update(index + 1, { status: `[处理完成] ${chalk.green(finalResult.title.slice(0, 30))}...` });
-
-            } catch (error) {
-                const errorMessage = error.message || '未知错误';
-                logger.error(`议题处理失败: ${meta.url}`, { error: errorMessage });
-                failedArticles.set(meta.url, { ...meta, message: errorMessage });
-                processingQueue.push(meta);
-                progressBar.update(index + 1, { status: `[处理失败] ${chalk.red(shortTitle)}... 将重试` });
+        } catch (error) {
+            logger.warn(`处理《${articleMeta.title}》第 ${attempt}/${CONFIG.processing.maxOverallRetries} 次尝试失败: ${error.message}`);
+            if (attempt === CONFIG.processing.maxOverallRetries) {
+                // 这是最后一次尝试，向上抛出错误，通知主流程此文章处理失败
+                throw new Error(`文章《${articleMeta.title}》在所有重试后仍然失败。`);
             }
+            // 等待指数退避时间后重试
+            const delay = CONFIG.llm.retryDelay * Math.pow(2, attempt - 1);
+            await new Promise(res => setTimeout(res, delay));
         }
-        overallRetryCount++;
     }
-
-    progressBar.stop();
-    
-    if (processingQueue.length > 0) {
-        console.log(chalk.red.bold(`\n❌ 经过 ${CONFIG.processing.maxOverallRetries} 轮尝试后，仍有 ${processingQueue.length} 篇议题处理失败:`));
-        processingQueue.forEach(fail => {
-            const failReason = failedArticles.get(fail.url)?.message || '未知错误';
-            console.log(chalk.red(`     - ${fail.title}: ${failReason}`));
-        });
-    }
-
-    return successfulArticles;
 }
