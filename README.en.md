@@ -8,7 +8,7 @@
 
 - **🤖 Automated Crawling & Discovery**: Starts from a seed URL and automatically discovers and scrapes article and category links from the website.
 - **🏆 Two-Phase Tournament Ranking**: Innovatively uses a "Swiss-style" tournament system, featuring a "Qualification Round" and a "Finals Round," to efficiently and fairly select the most important news articles.
-- **💡 Intelligent Clustering & Deduplication**: Intelligently groups similar articles into the same news topic by extracting keywords from titles, and selects the highest-scoring representative from each topic, ensuring news uniqueness and diversity.
+- **💡 Intelligent Clustering & Deduplication**: (New) **Leverages the LLM for efficient semantic clustering**. By comparing batches of article titles, it accurately identifies different articles reporting on the same news event, merges them into a single topic, and selects the highest-scoring one as the representative, ensuring news uniqueness and diversity.
 - **🧠 Deeply Empowered by LLM**: Fully leverages a Large Language Model (LLM) to perform complex natural language tasks, serving as the core engine of the project:
     - **Link Classification**: Determines whether a link points to a specific article or a news category page.
     - **Content Ranking**: Ranks a set of news items by importance based on a user-defined "task description".
@@ -30,7 +30,7 @@
 The tool's execution flow is clearly divided into five main steps, orchestrated by `index.js`:
 
 1.  **[Step 1/5] Crawl & Qualify**: The `crawler.js` module starts from the entry URL, recursively crawling links on pages. It then uses a multi-round, points-based "qualification tournament" to preliminarily filter for potentially valuable candidate articles from a large number of links.
-2.  **[Step 2/5] Cluster & Deduplicate**: The `grouper.js` module performs keyword extraction and cluster analysis on the articles that passed qualification. It groups articles reporting on the same event and selects a "representative" for each group, thus filtering out duplicate content.
+2.  **[Step 2/5] Cluster & Deduplicate**: The `grouper.js` module uses an efficient, batch-based approach to call the LLM for semantic clustering. It groups articles reporting on the same event and selects a "representative" for each group, thus filtering out duplicate content.
 3.  **[Step 3/5] Finals Tournament**: The `ranker.js` module conducts the final "tournament ranking" on the list of unique articles. Through multiple rounds of group comparisons and point scoring, it precisely determines the importance order of each article.
 4.  **[Step 4/5] Process & Summarize**: The `processor.js` module is responsible for processing the final selection of articles. It extracts the original text, calls the LLM for analysis and summarization, parses the returned JSON data, and includes a powerful built-in logic for retrying failed attempts.
 5.  **[Step 5/5] Generate Final Report**: The `reporter.js` module handles the final wrap-up. It calls the LLM to generate an "Editor's Introduction" and then compiles all the processed article data into a beautifully formatted Markdown briefing.
@@ -39,7 +39,7 @@ The tool's execution flow is clearly divided into five main steps, orchestrated 
 
 1.  **Clone the Repository**
     ```bash
-    git clone [https://github.com/hixyl/aiNewsAgent.git](https://github.com/hixyl/aiNewsAgent.git)
+    git clone https://github.com/hixyl/aiNewsAgent.git
     cd aiNewsAgent
     ```
 
