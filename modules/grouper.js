@@ -20,6 +20,7 @@ function robustJsonParse(responseText) {
         return JSON.parse(jsonMatch[0]);
     } catch (error) {
         try {
+            // 尝试修复JSON字符串中可能存在的尾随逗号问题
             const fixedJson = jsonMatch[0].replace(/,\s*([\}\]])/g, '$1');
             return JSON.parse(fixedJson);
         } catch (finalError) {
@@ -38,7 +39,8 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     if (articles.length < 2) return articles;
 
     console.log(chalk.cyan.bold('\n启动基于全局图的聚类流程 (发现关系 -> 构建图 -> 查找簇)...'));
-    const { qualificationConcurrency, groupingBatchSize } = CONFIG.ranking;
+    // **(修改)** 从CONFIG中解构出新的重试参数
+    const { qualificationConcurrency, groupingBatchSize, groupingMaxRetries, groupingRetryDelay } = CONFIG.ranking;
     const limit = pLimit(qualificationConcurrency);
 
     const articlesWithId = articles.map((article, index) => ({ ...article, id: index }));
@@ -52,64 +54,97 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     progressBar.start(articles.length, 0, { status: "步骤1a: 查找批次内的相似关系..." });
     const batches = _.chunk(articlesWithId, groupingBatchSize);
     for (const batch of batches) {
-        try {
-            const { system, user } = CONFIG.prompts.findSimilarPairs(batch);
-            const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
-            const similarPairsInBatch = robustJsonParse(responseText);
+        // **(核心修改)** 在此处增加重试逻辑
+        let success = false;
+        for (let attempt = 1; attempt <= groupingMaxRetries; attempt++) {
+            try {
+                const { system, user } = CONFIG.prompts.findSimilarPairs(batch);
+                const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
+                const clustersInBatch = robustJsonParse(responseText);
 
-            if (Array.isArray(similarPairsInBatch)) {
-                for (const pair of similarPairsInBatch) {
-                    if (pair.length === 2 && batch[pair[0]] && batch[pair[1]]) {
-                        // 将批次内的局部索引转换为全局ID
-                        const globalId1 = batch[pair[0]].id;
-                        const globalId2 = batch[pair[1]].id;
-                        allSimilarPairs.push([globalId1, globalId2]);
+                if (Array.isArray(clustersInBatch)) {
+                    for (const cluster of clustersInBatch) {
+                        if (Array.isArray(cluster) && cluster.length > 1) {
+                            for (let i = 0; i < cluster.length; i++) {
+                                for (let j = i + 1; j < cluster.length; j++) {
+                                    const localIndex1 = cluster[i];
+                                    const localIndex2 = cluster[j];
+                                    if (batch[localIndex1] && batch[localIndex2]) {
+                                        const globalId1 = batch[localIndex1].id;
+                                        const globalId2 = batch[localIndex2].id;
+                                        allSimilarPairs.push([globalId1, globalId2]);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                success = true; // 成功执行，跳出重试循环
+                break;
+            } catch (error) {
+                logger.warn(`聚类批次处理失败 (尝试 ${attempt}/${groupingMaxRetries}): ${error.message}`);
+                if (attempt === groupingMaxRetries) {
+                    logger.error(`批次处理在所有重试后仍然失败，跳过此批次。`, { batchTitles: batch.map(a => a.title) });
+                } else {
+                    // 等待指数退避时间后重试
+                    const delay = groupingRetryDelay * Math.pow(2, attempt - 1);
+                    await new Promise(res => setTimeout(res, delay));
+                }
             }
-        } catch (error) {
-            logger.warn(`批次内关系查找失败: ${error.message}`);
         }
         progressBar.increment(batch.length);
     }
     progressBar.stop();
-    logger.info(`完成批次内关系查找，发现 ${allSimilarPairs.length} 对相似关系。`);
+    logger.info(`完成批次内关系查找，初步发现 ${allSimilarPairs.length} 对相似关系。`);
 
     // 1b. 通过“代表交叉对比”，补充“跨批次”的相似关系
     console.log(chalk.cyan('步骤1b: 通过代表交叉对比，查找跨批次的相似关系...'));
-
-    // 基于现有关系，进行初步聚合，形成“簇核”
     const initialClusters = findConnectedComponents(articles.length, allSimilarPairs);
-    
-    // 从每个“簇核”中选举代表（得分最高者）
     const representatives = initialClusters.map(clusterIds => {
         const clusterArticles = clusterIds.map(id => articleMap[id]);
         return _.orderBy(clusterArticles, ['score'], ['desc'])[0];
-    }).filter(Boolean); // 过滤掉空簇
+    }).filter(Boolean);
 
     if (representatives.length > 1) {
         const repBatches = _.chunk(representatives, groupingBatchSize);
         progressBar.start(representatives.length, 0, { status: "交叉对比代表文章..." });
 
         for (const repBatch of repBatches) {
-             try {
-                const { system, user } = CONFIG.prompts.findSimilarPairs(repBatch);
-                const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
-                const similarRepPairs = robustJsonParse(responseText);
+             // **(核心修改)** 在此处也增加同样的重试逻辑
+            let success = false;
+            for (let attempt = 1; attempt <= groupingMaxRetries; attempt++) {
+                try {
+                    const { system, user } = CONFIG.prompts.findSimilarPairs(repBatch);
+                    const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
+                    const similarRepClusters = robustJsonParse(responseText);
 
-                if (Array.isArray(similarRepPairs)) {
-                    for (const pair of similarRepPairs) {
-                        if (pair.length === 2 && repBatch[pair[0]] && repBatch[pair[1]]) {
-                            const rep1 = repBatch[pair[0]];
-                            const rep2 = repBatch[pair[1]];
-                            // 将代表之间的关系，添加回全局关系列表
-                            allSimilarPairs.push([rep1.id, rep2.id]);
-                            logger.debug(`发现跨簇关系: "${rep1.title}" <-> "${rep2.title}"`);
+                    if (Array.isArray(similarRepClusters)) {
+                        for (const cluster of similarRepClusters) {
+                            if (Array.isArray(cluster) && cluster.length > 1) {
+                                for (let i = 0; i < cluster.length; i++) {
+                                    for (let j = i + 1; j < cluster.length; j++) {
+                                        const rep1 = repBatch[cluster[i]];
+                                        const rep2 = repBatch[cluster[j]];
+                                        if(rep1 && rep2) {
+                                            allSimilarPairs.push([rep1.id, rep2.id]);
+                                            logger.debug(`发现跨簇关系: "${rep1.title}" <-> "${rep2.title}"`);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+                    success = true; // 成功执行，跳出重试循环
+                    break;
+                } catch (error) {
+                    logger.warn(`代表交叉对比失败 (尝试 ${attempt}/${groupingMaxRetries}): ${error.message}`);
+                    if (attempt === groupingMaxRetries) {
+                         logger.error(`代表交叉对比在所有重试后仍然失败，跳过此批次。`, { batchTitles: repBatch.map(a => a.title) });
+                    } else {
+                        const delay = groupingRetryDelay * Math.pow(2, attempt - 1);
+                        await new Promise(res => setTimeout(res, delay));
+                    }
                 }
-            } catch (error) {
-                logger.warn(`代表交叉对比失败: ${error.message}`);
             }
             progressBar.increment(repBatch.length);
         }
@@ -127,7 +162,6 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     console.log(chalk.cyan.bold('\n--- 阶段 3/3: 格式化最终议题 ---'));
     const uniqueContenders = finalClusters.map(clusterMemberIds => {
         const members = clusterMemberIds.map(id => articleMap[id]);
-        // 按资格赛分数选出代表
         const representative = _.orderBy(members, ['score'], ['desc'])[0];
         return {
             ...representative,
@@ -139,7 +173,6 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
 
     logger.info(`全局图聚类完成，从 ${articles.length} 篇文章中识别出 ${uniqueContenders.length} 个独立新闻议题。`);
     
-    // 最后根据代表文章的资格赛分数进行排序
     return _.orderBy(uniqueContenders, ['score'], ['desc']);
 }
 
@@ -153,20 +186,19 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
 function findConnectedComponents(numNodes, edges) {
     if (numNodes === 0) return [];
     
-    // 1. 构建邻接表来表示图
     const adj = Array.from({ length: numNodes }, () => []);
     for (const [u, v] of edges) {
-        adj[u].push(v);
-        adj[v].push(u);
+        if (u < numNodes && v < numNodes) {
+            adj[u].push(v);
+            adj[v].push(u);
+        }
     }
 
     const clusters = [];
     const visited = new Array(numNodes).fill(false);
 
-    // 2. 遍历所有节点
     for (let i = 0; i < numNodes; i++) {
         if (!visited[i]) {
-            // 3. 如果节点未被访问，从它开始进行BFS，找到一个完整的连通分量
             const currentCluster = [];
             const queue = [i];
             visited[i] = true;
@@ -175,10 +207,12 @@ function findConnectedComponents(numNodes, edges) {
                 const u = queue.shift();
                 currentCluster.push(u);
 
-                for (const v of adj[u]) {
-                    if (!visited[v]) {
-                        visited[v] = true;
-                        queue.push(v);
+                if (adj[u]) {
+                    for (const v of adj[u]) {
+                        if (!visited[v]) {
+                            visited[v] = true;
+                            queue.push(v);
+                        }
                     }
                 }
             }
