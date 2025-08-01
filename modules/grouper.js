@@ -29,7 +29,7 @@ function robustJsonParse(responseText) {
 }
 
 /**
- * (已重构) 使用“广泛聚类后验证拆分”的三阶段策略，对文章进行语义聚类和去重。
+ * (已重构) 使用基于图论的全局聚类算法，确保聚类的全局一致性。
  * @param {Array<object>} articles - 候选文章列表。
  * @param {import('cli-progress').SingleBar} progressBar - 进度条实例。
  * @returns {Promise<Array<object>>} - 经过聚类和去重后的最终议题列表。
@@ -37,116 +37,97 @@ function robustJsonParse(responseText) {
 export async function groupAndDeduplicateArticles(articles, progressBar) {
     if (articles.length < 2) return articles;
 
-    console.log(chalk.cyan.bold('\n启动三阶段聚类流程 (广泛聚类 -> 验证拆分 -> 定型)...'));
+    console.log(chalk.cyan.bold('\n启动基于全局图的聚类流程 (发现关系 -> 构建图 -> 查找簇)...'));
     const { qualificationConcurrency, groupingBatchSize } = CONFIG.ranking;
     const limit = pLimit(qualificationConcurrency);
+
+    const articlesWithId = articles.map((article, index) => ({ ...article, id: index }));
+    const articleMap = _.keyBy(articlesWithId, 'id');
     
-    let articlesWithTempId = articles.map((article, index) => ({
-        ...article,
-        tempId: index
-    }));
-    let articleMap = _.keyBy(articlesWithTempId, 'tempId');
+    // --- 阶段一: 分批寻找“原子关系”，并全局汇总 ---
+    console.log(chalk.cyan.bold('\n--- 阶段 1/3: 发现全局相似关系 ---'));
+    let allSimilarPairs = [];
 
-
-    // --- 阶段一: 广泛主题聚类 ---
-    console.log(chalk.cyan.bold('\n--- 阶段 1/3: 广泛主题聚类 ---'));
-    progressBar.start(articles.length, 0, { status: "进行初步的广泛聚类..." });
-
-    const batches = _.chunk(articlesWithTempId, groupingBatchSize * 2);
-    let roughClusters = {};
-    let clusterCounter = 0;
-
+    // 1a. 分批处理，寻找“批次内”的相似关系
+    progressBar.start(articles.length, 0, { status: "步骤1a: 查找批次内的相似关系..." });
+    const batches = _.chunk(articlesWithId, groupingBatchSize);
     for (const batch of batches) {
         try {
-            const { system, user } = CONFIG.prompts.initialBroadClustering(batch);
+            const { system, user } = CONFIG.prompts.findSimilarPairs(batch);
             const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
-            const batchClusters = robustJsonParse(responseText);
+            const similarPairsInBatch = robustJsonParse(responseText);
 
-            for (const topic in batchClusters) {
-                const memberIds = batchClusters[topic];
-                if (Array.isArray(memberIds) && memberIds.length > 1) {
-                    const globalIds = memberIds.map(localId => batch[localId]?.tempId).filter(id => id !== undefined);
-                    if (globalIds.length > 1) {
-                         roughClusters[`topic_${clusterCounter++}`] = globalIds;
+            if (Array.isArray(similarPairsInBatch)) {
+                for (const pair of similarPairsInBatch) {
+                    if (pair.length === 2 && batch[pair[0]] && batch[pair[1]]) {
+                        // 将批次内的局部索引转换为全局ID
+                        const globalId1 = batch[pair[0]].id;
+                        const globalId2 = batch[pair[1]].id;
+                        allSimilarPairs.push([globalId1, globalId2]);
                     }
                 }
             }
         } catch (error) {
-            logger.warn(`广泛聚类批次处理失败: ${error.message}`);
+            logger.warn(`批次内关系查找失败: ${error.message}`);
         }
         progressBar.increment(batch.length);
     }
-    
-    const clusteredIds = new Set(_.flatten(Object.values(roughClusters)));
-    articlesWithTempId.forEach(article => {
-        if (!clusteredIds.has(article.tempId)) {
-            roughClusters[`topic_${clusterCounter++}`] = [article.tempId];
-        }
-    });
-
     progressBar.stop();
-    console.log(chalk.green(`初步聚类完成，形成 ${Object.keys(roughClusters).length} 个粗略议题簇。`));
+    logger.info(`完成批次内关系查找，发现 ${allSimilarPairs.length} 对相似关系。`);
+
+    // 1b. 通过“代表交叉对比”，补充“跨批次”的相似关系
+    console.log(chalk.cyan('步骤1b: 通过代表交叉对比，查找跨批次的相似关系...'));
+
+    // 基于现有关系，进行初步聚合，形成“簇核”
+    const initialClusters = findConnectedComponents(articles.length, allSimilarPairs);
     
+    // 从每个“簇核”中选举代表（得分最高者）
+    const representatives = initialClusters.map(clusterIds => {
+        const clusterArticles = clusterIds.map(id => articleMap[id]);
+        return _.orderBy(clusterArticles, ['score'], ['desc'])[0];
+    }).filter(Boolean); // 过滤掉空簇
 
-    // --- 阶段二: 簇内验证与拆分 (已更新为逐一验证) ---
-    console.log(chalk.cyan.bold('\n--- 阶段 2/3: 逐一验证与精确拆分 ---'));
-    progressBar.start(Object.keys(roughClusters).length, 0, { status: "验证簇的内部一致性..." });
+    if (representatives.length > 1) {
+        const repBatches = _.chunk(representatives, groupingBatchSize);
+        progressBar.start(representatives.length, 0, { status: "交叉对比代表文章..." });
 
-    let refinedClusters = [];
-    const allClusterTasks = Object.values(roughClusters).map(memberIds => limit(async () => {
-        try {
-            const memberArticles = memberIds.map(id => articleMap[id]);
-            if (memberArticles.length <= 1) {
-                refinedClusters.push(memberArticles);
-                progressBar.increment();
-                return;
-            }
+        for (const repBatch of repBatches) {
+             try {
+                const { system, user } = CONFIG.prompts.findSimilarPairs(repBatch);
+                const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
+                const similarRepPairs = robustJsonParse(responseText);
 
-            // a. 为当前簇生成核心主题
-            const titles = memberArticles.map(m => m.title);
-            const themePrompt = CONFIG.prompts.generateClusterTheme(titles);
-            const coreTheme = await callLLM([{ role: 'system', content: themePrompt.system }, { role: 'user', content: themePrompt.user }], 0.0);
-
-            // b. (核心修改) 逐一验证每个成员是否符合核心主题
-            const consistentMembers = [];
-            const verificationPromises = memberArticles.map(async (article) => {
-                const { system, user } = CONFIG.prompts.verifySingleArticleConsistency(coreTheme, article.title);
-                const result = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.0);
-                return { article, isConsistent: result.toLowerCase().includes('yes') };
-            });
-            const verificationResults = await Promise.all(verificationPromises);
-
-            // c. 执行拆分
-            verificationResults.forEach(({ article, isConsistent }) => {
-                if (isConsistent) {
-                    consistentMembers.push(article);
-                } else {
-                    refinedClusters.push([article]); // 被踢出的文章成为新的独立簇
-                    logger.debug(`拆分: "${article.title}" 因与主题 "${coreTheme}" 不符而被移出。`);
+                if (Array.isArray(similarRepPairs)) {
+                    for (const pair of similarRepPairs) {
+                        if (pair.length === 2 && repBatch[pair[0]] && repBatch[pair[1]]) {
+                            const rep1 = repBatch[pair[0]];
+                            const rep2 = repBatch[pair[1]];
+                            // 将代表之间的关系，添加回全局关系列表
+                            allSimilarPairs.push([rep1.id, rep2.id]);
+                            logger.debug(`发现跨簇关系: "${rep1.title}" <-> "${rep2.title}"`);
+                        }
+                    }
                 }
-            });
-
-            if (consistentMembers.length > 0) {
-                refinedClusters.push(consistentMembers);
+            } catch (error) {
+                logger.warn(`代表交叉对比失败: ${error.message}`);
             }
-        } catch (error) {
-            logger.warn(`簇验证和拆分失败: ${error.message}`);
-            const memberArticles = memberIds.map(id => articleMap[id]);
-            memberArticles.forEach(article => refinedClusters.push([article]));
-        } finally {
-            progressBar.increment();
+            progressBar.increment(repBatch.length);
         }
-    }));
-    
-    await Promise.all(allClusterTasks);
-    progressBar.stop();
-    console.log(chalk.green(`验证拆分完成，议题数量调整为 ${refinedClusters.length} 个。`));
+        progressBar.stop();
+    }
+    logger.info(`完成代表交叉对比，最终共发现 ${allSimilarPairs.length} 对全局相似关系。`);
+
+
+    // --- 阶段二: 在“全局图”上执行算法，查找最终簇 ---
+    console.log(chalk.cyan.bold('\n--- 阶段 2/3: 构建全局图并查找最终议题簇 ---'));
+    const finalClusters = findConnectedComponents(articles.length, allSimilarPairs);
 
 
     // --- 阶段三: 收尾与格式化 ---
-    console.log(chalk.green.bold('\n--- 阶段 3/3: 格式化最终议题 ---'));
-    
-    const uniqueContenders = refinedClusters.map(members => {
+    console.log(chalk.cyan.bold('\n--- 阶段 3/3: 格式化最终议题 ---'));
+    const uniqueContenders = finalClusters.map(clusterMemberIds => {
+        const members = clusterMemberIds.map(id => articleMap[id]);
+        // 按资格赛分数选出代表
         const representative = _.orderBy(members, ['score'], ['desc'])[0];
         return {
             ...representative,
@@ -156,7 +137,54 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
         };
     });
 
-    logger.info(`三阶段聚类完成，从 ${articles.length} 篇文章中识别出 ${uniqueContenders.length} 个高度相关的独立新闻议题。`);
+    logger.info(`全局图聚类完成，从 ${articles.length} 篇文章中识别出 ${uniqueContenders.length} 个独立新闻议题。`);
     
+    // 最后根据代表文章的资格赛分数进行排序
     return _.orderBy(uniqueContenders, ['score'], ['desc']);
+}
+
+
+/**
+ * 使用图的广度优先搜索（BFS）查找所有连通分量（即簇）。
+ * @param {number} numNodes - 图中的节点总数（文章总数）
+ * @param {Array<Array<number>>} edges - 边的列表，每条边是 [node1, node2]
+ * @returns {Array<Array<number>>} - 返回一个数组，每个子数组是一个连通分量（簇）的节点ID列表
+ */
+function findConnectedComponents(numNodes, edges) {
+    if (numNodes === 0) return [];
+    
+    // 1. 构建邻接表来表示图
+    const adj = Array.from({ length: numNodes }, () => []);
+    for (const [u, v] of edges) {
+        adj[u].push(v);
+        adj[v].push(u);
+    }
+
+    const clusters = [];
+    const visited = new Array(numNodes).fill(false);
+
+    // 2. 遍历所有节点
+    for (let i = 0; i < numNodes; i++) {
+        if (!visited[i]) {
+            // 3. 如果节点未被访问，从它开始进行BFS，找到一个完整的连通分量
+            const currentCluster = [];
+            const queue = [i];
+            visited[i] = true;
+
+            while (queue.length > 0) {
+                const u = queue.shift();
+                currentCluster.push(u);
+
+                for (const v of adj[u]) {
+                    if (!visited[v]) {
+                        visited[v] = true;
+                        queue.push(v);
+                    }
+                }
+            }
+            clusters.push(currentCluster);
+        }
+    }
+
+    return clusters;
 }
