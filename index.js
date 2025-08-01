@@ -25,7 +25,7 @@ async function main() {
     logger.info('--- 程序启动 ---');
 
     const today = new Date().toISOString().slice(0, 10);
-    const domain = CONFIG.startUrl.split('://')[1]?.split('.')[0]
+    const domain = CONFIG.startUrl.split('://')[1]?.split('/')[0]
     const dailyOutputDir = path.join(CONFIG.outputBaseDir, `${today}_${domain}`);
     await fs.mkdir(dailyOutputDir, { recursive: true });
 
