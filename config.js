@@ -13,7 +13,7 @@ const __dirname = path.dirname(__filename);
 const CONFIG = {
     // 任务定义
     taskDescription: '为中国大陆的读者提供一份关于国家重要新闻的每日简报。',
-    startUrl: 'https://www.bbc.com/',
+    startUrl: 'http://www.xinhuanet.com/',
 
     // 调试与输出
     debugMode: false, // 设置为 true 可在控制台看到详细的 LLM 请求日志

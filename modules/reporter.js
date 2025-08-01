@@ -7,6 +7,7 @@ import CONFIG from '../config.js';
 import logger from '../utils/logger.js';
 import { getCategoryEmoji } from '../utils/helpers.js';
 import { callLLM } from '../services/network.js';
+import _ from 'lodash'; 
 
 /**
  * 根据处理好的文章数据，生成最终的Markdown简报
@@ -22,19 +23,23 @@ export async function generateFinalReport(articles, dailyOutputDir, spinner) {
         return null;
     }
 
+    // 在生成报告前，根据锦标赛得分对所有成功处理的文章进行最终排序，确保顺序与重要性一致。
+    // 使用 lodash 的 orderBy 可以稳定地处理排序。
+    const sortedArticles = _.orderBy(articles, ['tournamentScore'], ['desc']);
+    logger.info(`已根据最终重要性得分对 ${articles.length} 篇成功处理的文章完成排序。`);
+
     spinner.start('AI正在撰写总编导语...');
     const today = new Date().toISOString().slice(0, 10);
-    const conciseSummariesText = articles
-        // 使用LLM生成的新标题
+    const conciseSummariesText = sortedArticles
         .map((a, i) => `${i + 1}. 【${a.category}】${a.title}: ${a.conciseSummary}`)
         .join('\n');
-    
+
     const { system, user } = CONFIG.prompts.generateEditorIntro(conciseSummariesText);
     let editorIntroduction = "今日要闻看点：";
     try {
         editorIntroduction = await callLLM(
-            [{ role: 'system', content: system }, { role: 'user', content: user }], 
-            0.6, 
+            [{ role: 'system', content: system }, { role: 'user', content: user }],
+            0.6,
             CONFIG.llm.longRequestTimeout
         );
     } catch (error) {
@@ -48,14 +53,14 @@ export async function generateFinalReport(articles, dailyOutputDir, spinner) {
 
     // 生成目录
     finalMarkdown += `### **目录 (Table of Contents)**\n`;
-    articles.forEach((article, index) => {
+    sortedArticles.forEach((article, index) => {
         // 使用LLM生成的新标题
         finalMarkdown += `${index + 1}. [${getCategoryEmoji(article.category)}【${article.category}】${article.title}](#${index + 1})\n`;
     });
     finalMarkdown += `\n---\n\n`;
 
     // 生成正文
-    for (const [index, article] of articles.entries()) {
+    for (const [index, article] of sortedArticles.entries()) {
         // 使用LLM生成的新标题
         finalMarkdown += `### <a id="${index + 1}"></a> ${index + 1}. ${getCategoryEmoji(article.category)}【${article.category}】${article.title}\n\n`;
         finalMarkdown += `* **一句话摘要**: ${article.conciseSummary}\n`;

@@ -177,7 +177,8 @@ export async function processAndSummarizeArticles(articles, dailyOutputDir, prog
                 });
 
                 // 使用LLM生成的新标题来创建文件名
-                const safeFilename = createSafeArticleFilename(successfulArticles.length, processedData.title);
+                // const safeFilename = createSafeArticleFilename(successfulArticles.length, processedData.title);
+                const safeFilename = createSafeArticleFilename(meta.rank - 1, processedData.title);
                 const articleFilePath = path.join(individualArticlesDir, safeFilename);
                 
                 const finalResult = { ...meta, ...processedData };
