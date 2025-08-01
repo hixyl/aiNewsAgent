@@ -8,6 +8,48 @@ import logger from '../utils/logger.js';
 import { fetchAndParsePage, callLLM } from '../services/network.js';
 
 /**
+ * (新增) 对发现的栏目链接进行排名，并选出最重要的栏目。
+ * @param {Array<object>} categories - 栏目链接对象列表
+ * @returns {Promise<Array<object>>} - 按重要性得分排序后的栏目列表
+ */
+async function rankAndSelectCategories(categories) {
+    const { categoryRankingGroupSize, categoryRankingPoints } = CONFIG.crawling;
+    const limit = pLimit(CONFIG.ranking.qualificationConcurrency); // 复用资格赛的并发设置
+
+    let categoriesWithScores = categories.map(cat => ({ ...cat, score: 0 }));
+
+    const groups = _.chunk(_.shuffle(categoriesWithScores), categoryRankingGroupSize);
+
+    const rankingPromises = groups.map(group => limit(async () => {
+        try {
+            const groupTitles = group.map(cat => cat.title);
+            const { system, user } = CONFIG.prompts.rankCategories(groupTitles, CONFIG.taskDescription);
+            const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
+
+            const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
+
+            rankedIndices.forEach((originalIndex, rank) => {
+                const categoryInGroup = group[originalIndex];
+                if (categoryInGroup && categoryRankingPoints[rank] !== undefined) {
+                    // 找到主列表中的对象并更新分数
+                    const targetCategory = categoriesWithScores.find(c => c.url === categoryInGroup.url);
+                    if (targetCategory) {
+                        targetCategory.score += categoryRankingPoints[rank];
+                    }
+                }
+            });
+        } catch (error) {
+            logger.warn('栏目小组排名失败', { error: error.message });
+        }
+    }));
+
+    await Promise.all(rankingPromises);
+
+    return _.orderBy(categoriesWithScores, ['score'], ['desc']);
+}
+
+
+/**
  * (已重构) 发现文章链接并通过多轮瑞士制资格赛筛选出候选者。
  * 不再是简单的分组淘汰，而是通过多轮比拼和积分，更公平地选出优胜者。
  * @param {import('ora').Ora} spinner - Ora微调器实例，用于显示状态
@@ -62,11 +104,25 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                     } catch (e) { /* 忽略无效URL */ }
                 }
             }
+
+            // **核心修改**: 对发现的新栏目进行排名，并选择最重要的进行下一步探索
             if (newCategoryPages.length > 0) {
-                const pagesToAdd = newCategoryPages
-                    .slice(0, CONFIG.crawling.maxCategoryPages)
-                    .map(p => ({ url: p.url, depth: currentPage.depth + 1 }));
-                pagesToVisit.push(...pagesToAdd);
+                if (newCategoryPages.length > CONFIG.crawling.maxCategoriesToExplore) {
+                    spinner.text = `[${pagesExplored}] [深度 ${currentPage.depth}] 发现 ${newCategoryPages.length} 个新栏目，正在进行重要性排名...`;
+                    
+                    const rankedCategories = await rankAndSelectCategories(newCategoryPages);
+                    const topCategories = rankedCategories.slice(0, CONFIG.crawling.maxCategoriesToExplore);
+                    
+                    spinner.text = `[${pagesExplored}] [深度 ${currentPage.depth}] 排名完成，选出 ${topCategories.length} 个重要栏目继续探索。`;
+                    logger.info(`在深度 ${currentPage.depth}，从 ${newCategoryPages.length} 个栏目中选出最重要的 ${topCategories.length} 个进行下一步探索。`);
+                    
+                    const pagesToAdd = topCategories.map(p => ({ url: p.url, depth: currentPage.depth + 1 }));
+                    pagesToVisit.push(...pagesToAdd);
+                } else {
+                    // 如果发现的栏目数量不足配置的最大探索数，则全部加入
+                    const pagesToAdd = newCategoryPages.map(p => ({ url: p.url, depth: currentPage.depth + 1 }));
+                    pagesToVisit.push(...pagesToAdd);
+                }
             }
         } catch (error) {
             spinner.warn(chalk.yellow(`页面探索失败 ${currentPage.url}: ${error.message}`));
@@ -79,7 +135,7 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     let articleLinks = Array.from(allFoundLinks.values()).map(link => ({ ...link, score: 0 }));
     if (articleLinks.length === 0) return [];
 
-    // --- 资格赛 (重构为瑞士制) ---
+    // --- 资格赛 (瑞士制) ---
     const { qualificationRounds, qualificationGroupSize, qualificationPoints, qualificationConcurrency } = CONFIG.ranking;
     const totalComparisons = qualificationRounds * Math.ceil(articleLinks.length / qualificationGroupSize);
     progressBar.start(totalComparisons, 0, { status: "资格赛 - 初始化..." });
@@ -87,7 +143,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     const limit = pLimit(qualificationConcurrency);
 
     for (let round = 1; round <= qualificationRounds; round++) {
-        // 第一轮随机分组，后续轮次根据分数排序分组
         const articlesToRank = round === 1 
             ? _.shuffle(articleLinks) 
             : _.orderBy(articleLinks, ['score'], ['desc']);
@@ -105,7 +160,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                 rankedIndices.forEach((originalIndex, rank) => {
                     const articleInGroup = group[originalIndex];
                     if (articleInGroup && qualificationPoints[rank] !== undefined) {
-                        // 在主列表中找到对应的文章并累加分数
                         const targetArticle = articleLinks.find(a => a.url === articleInGroup.url);
                         if (targetArticle) {
                             targetArticle.score += qualificationPoints[rank];
@@ -123,7 +177,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
 
     progressBar.stop();
     
-    // 按最终得分排序，选出优胜者进入决赛圈
     const finalRankedLinks = _.orderBy(articleLinks, ['score'], ['desc']);
     const contenders = finalRankedLinks.slice(0, CONFIG.ranking.contendersToRank);
     
