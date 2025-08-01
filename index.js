@@ -11,6 +11,7 @@ import CONFIG from './config.js';
 import logger from './utils/logger.js';
 import { gracefulShutdown } from './utils/helpers.js';
 import { discoverAndRankContenders } from './modules/crawler.js';
+import { groupAndDeduplicateArticles } from './modules/grouper.js'; // <-- 引入新模块
 import { runFinalTournament } from './modules/ranker.js';
 import { processAndSummarizeArticles } from './modules/processor.js';
 import { generateFinalReport } from './modules/reporter.js';
@@ -40,7 +41,7 @@ async function main() {
 
     try {
         // --- 步骤 1: 抓取与资格赛 ---
-        console.log(boxen(chalk.bold.cyan('[步骤 1/4] 抓取链接并进行资格赛筛选'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
+        console.log(boxen(chalk.bold.cyan('[步骤 1/5] 抓取链接并进行资格赛筛选'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
         const qualificationProgressBar = multiBar.create(1, 0, { step: chalk.magenta.bold('资格赛'.padStart(6)) });
         const contenders = await discoverAndRankContenders(spinner, qualificationProgressBar);
         multiBar.remove(qualificationProgressBar);
@@ -52,24 +53,31 @@ async function main() {
             return;
         }
 
-        // --- 步骤 2: 决赛圈排名 ---
-        console.log(boxen(chalk.bold.cyan('[步骤 2/4] 决赛圈锦标赛排名'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
+        // --- (新) 步骤 2: 文章聚类与去重 ---
+        console.log(boxen(chalk.bold.cyan('[步骤 2/5] 基于关键词的文章聚类与去重'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
+        const groupingProgressBar = multiBar.create(contenders.length, 0, { step: chalk.cyan.bold('文章聚类'.padStart(6)) });
+        const uniqueContenders = await groupAndDeduplicateArticles(contenders, groupingProgressBar);
+        multiBar.remove(groupingProgressBar);
+        console.log(chalk.cyan.bold(`\n✅ 聚类完成! 从 ${contenders.length} 篇候选文章中筛选出 ${uniqueContenders.length} 篇独特的文章进入决赛圈.`));
+
+        // --- 步骤 3: 决赛圈排名 ---
+        console.log(boxen(chalk.bold.cyan('[步骤 3/5] 决赛圈锦标赛排名'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
         const tournamentProgressBar = multiBar.create(1, 0, { step: chalk.yellow.bold('决赛圈'.padStart(6)) });
-        const rankedArticles = await runFinalTournament(contenders, tournamentProgressBar);
+        const rankedArticles = await runFinalTournament(uniqueContenders, tournamentProgressBar); // <-- 使用去重后的文章列表
         multiBar.remove(tournamentProgressBar);
 
         const articlesToProcess = rankedArticles.slice(0, CONFIG.processing.maxArticlesToProcess);
         articlesToProcessCount = articlesToProcess.length;
         console.log(chalk.cyan.bold(`\n✅ 决赛圈完成! 最终选定 ${articlesToProcess.length} 篇文章进行深度处理.`));
 
-        // --- 步骤 3: 处理文章与生成报告 ---
-        console.log(boxen(chalk.bold.cyan(`[步骤 3/4] 逐篇处理 ${articlesToProcess.length} 篇高价值文章 (内置失败重试)`), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
+        // --- 步骤 4: 处理文章与生成报告 ---
+        console.log(boxen(chalk.bold.cyan(`[步骤 4/5] 逐篇处理 ${articlesToProcess.length} 篇高价值文章 (内置失败重试)`), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
         const processingProgressBar = multiBar.create(articlesToProcess.length, 0, { step: chalk.blue.bold('文章处理'.padStart(6)) });
         const successfulArticles = await processAndSummarizeArticles(articlesToProcess, dailyOutputDir, processingProgressBar);
         successfulArticleCount = successfulArticles.length;
         
-        // --- 步骤 4: 生成最终简报 ---
-        console.log(boxen(chalk.bold.cyan('[步骤 4/4] 生成最终简报'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
+        // --- 步骤 5: 生成最终简报 ---
+        console.log(boxen(chalk.bold.cyan('[步骤 5/5] 生成最终简报'), { padding: 1, margin: { top: 1, bottom: 1 }, borderStyle: 'round', borderColor: 'cyan' }));
         const output = await generateFinalReport(successfulArticles, dailyOutputDir, spinner);
 
         multiBar.stop();
