@@ -8,15 +8,20 @@ import logger from '../utils/logger.js';
 import { callLLM } from '../services/network.js';
 
 /**
- * 解析LLM返回的聚类结果JSON。
+ * 安全地解析LLM返回的聚类结果JSON。
+ * @param {string} responseText - LLM的原始响应文本
+ * @param {Array<object>} candidates - 用于聚类的候选文章列表
+ * @returns {object} - 解析后的JSON对象
+ * @throws 如果解析失败或格式不符，则抛出错误
  */
 function robustParseGroupingResponse(responseText, candidates) {
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error(`聚类响应中未找到有效的JSON对象。收到: "${responseText}"`);
     try {
         const parsed = JSON.parse(jsonMatch[0]);
-        if (Object.keys(parsed).length !== candidates.length) {
-            logger.warn('LLM返回的聚类结果数量与候选文章数量不匹配。');
+        // 不再强制要求数量完全匹配，因为LLM有时可能会漏掉一两个，后续逻辑可以容忍
+        if (Object.keys(parsed).length === 0 && candidates.length > 0) {
+             throw new Error(`聚类响应JSON解析后为空对象。`);
         }
         return parsed;
     } catch (error) {
@@ -25,9 +30,12 @@ function robustParseGroupingResponse(responseText, candidates) {
 }
 
 /**
- * 验证簇内文章的一致性，并返回不一致的文章。
+ * 验证一个簇内部的文章是否主题一致，并分离出异常值。
+ * @param {Array<object>} cluster - 待验证的文章簇
+ * @returns {Promise<{consistent: Array<object>, outliers: Array<object>}>} - 返回包含一致性文章和异常文章的对象
  */
 async function verifyCluster(cluster) {
+    // 如果簇只有一个或没有文章，直接视为一致
     if (cluster.length <= 1) {
         return { consistent: cluster, outliers: [] };
     }
@@ -35,20 +43,25 @@ async function verifyCluster(cluster) {
     const titles = cluster.map(a => a.title);
 
     try {
+        // 步骤1: 为这个簇生成一个核心议题
         const { system: themeSystem, user: themeUser } = CONFIG.prompts.generateClusterTheme(titles);
         const theme = await callLLM([{ role: 'system', content: themeSystem }, { role: 'user', content: themeUser }], 0.2);
         
+        // 步骤2: 验证簇内所有标题是否都符合该议题
         const { system: verifySystem, user: verifyUser } = CONFIG.prompts.verifyClusterConsistency(theme, titles);
         const response = await callLLM([{ role: 'system', content: verifySystem }, { role: 'user', content: verifyUser }], 0.1);
 
+        // 如果所有标题都符合，直接返回原簇
         if (response.toLowerCase().trim() === 'none') {
             return { consistent: cluster, outliers: [] };
         }
 
+        // 解析出不符合议题的标题的索引
         const outlierIndices = response.split(',')
             .map(n => parseInt(n.trim(), 10) - 1)
             .filter(n => !isNaN(n) && n >= 0 && n < cluster.length);
         
+        // 如果没有找到有效的异常索引，也视为全部符合
         if (outlierIndices.length === 0) {
             return { consistent: cluster, outliers: [] };
         }
@@ -67,17 +80,19 @@ async function verifyCluster(cluster) {
             logger.info(`在议题 "${theme}" 的验证中，发现并剔除了 ${outliers.length} 个异常标题。`);
         }
         
+        // 返回拆分后的结果，如果一致性组为空，也返回空数组
         return { consistent: consistent.length > 0 ? consistent : [], outliers };
 
     } catch (error) {
-        logger.warn(`簇验证过程失败: ${error.message}。该簇将不进行拆分。`, { titles });
+        logger.warn(`簇验证过程失败: ${error.message}。该簇将不进行拆分，整体视为一致。`, { titles });
+        // 在验证失败时，为保证流程继续，保守地将整个簇视为一致的
         return { consistent: cluster, outliers: [] };
     }
 }
 
 /**
- * (新) 核心的、可重用的聚类与验证周期函数。
- * @param {Array<object>} articlesToProcess - 待处理的文章列表。
+ * 执行一轮完整的“初步聚类 + 验证精炼”周期。
+ * @param {Array<object>} articlesToProcess - 本轮待处理的文章列表。
  * @param {import('cli-progress').SingleBar} progressBar - 进度条实例。
  * @param {number} cycleNum - 当前的迭代轮次。
  * @returns {Promise<{finalizedClusters: Array<Array<object>>, remainingOutliers: Array<object>}>}
@@ -91,14 +106,18 @@ async function runClusteringCycle(articlesToProcess, progressBar, cycleNum) {
 
     progressBar.update(0, { status: `第${cycleNum}轮聚类: 初筛中...` });
     
+    // 循环处理所有待分类文章
     while (remainingToBatch.length > 0) {
         const batch = remainingToBatch.splice(0, groupingBatchSize);
+        // 代表列表是当前已经形成的簇中，得分最高的文章
         let representatives = initialClusters.map(c => _.orderBy(c, ['score'], ['desc'])[0]);
 
+        // 如果还没有代表，就从批次中选一个作为第一个代表
         if (representatives.length === 0) {
             if (batch.length > 0) {
                 initialClusters.push([batch.shift()]);
             }
+            // 如果批次空了，就结束本次循环
             if (batch.length === 0) continue;
             representatives = initialClusters.map(c => _.orderBy(c, ['score'], ['desc'])[0]);
         }
@@ -109,12 +128,15 @@ async function runClusteringCycle(articlesToProcess, progressBar, cycleNum) {
             const groupingResult = robustParseGroupingResponse(responseText, batch);
             
             Object.entries(groupingResult).forEach(([candidateId, clusterIndex]) => {
-                const article = batch[parseInt(candidateId.replace('A', ''), 10)];
-                if (!article) return;
+                const articleIndex = parseInt(candidateId.replace('A', ''), 10);
+                const article = batch[articleIndex];
+                if (!article) return; // 如果文章ID无效，则跳过
+
                 const targetIndex = clusterIndex - 1;
+                // 如果归类到已有的簇
                 if (clusterIndex > 0 && initialClusters[targetIndex]) {
                     initialClusters[targetIndex].push(article);
-                } else {
+                } else { // 否则，自己成为一个新簇
                     initialClusters.push([article]);
                 }
             });
@@ -152,8 +174,7 @@ async function runClusteringCycle(articlesToProcess, progressBar, cycleNum) {
 
 
 /**
- * (已重构) 使用迭代式方法对文章进行语义聚类和去重。
- * 多次运行“初筛+验证”周期，直到所有异常文章都被妥善处理。
+ * (已重构) 使用迭代式精炼方法对文章进行语义聚类和去重。
  * @param {Array<object>} articles - 候选文章列表。
  * @param {import('cli-progress').SingleBar} progressBar - 进度条实例。
  * @returns {Promise<Array<object>>} - 经过完整迭代和验证后的最终议题列表。
@@ -184,7 +205,8 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
         }
     }
     
-    if (cycleNum > MAX_CYCLES) {
+    // 如果达到最大循环次数后仍有剩余，则将它们各自视为独立议题
+    if (cycleNum > MAX_CYCLES && articlesToProcess.length > 0) {
         logger.warn(`聚类达到最大迭代次数 ${MAX_CYCLES}，仍有 ${articlesToProcess.length} 篇文章未完全聚类，将它们各自视为独立议题。`);
         articlesToProcess.forEach(article => allFinalizedClusters.push([article]));
     }
@@ -192,16 +214,19 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     console.log(chalk.green.bold('\n✅ 迭代式聚类完成!'));
     logger.info(`迭代式聚类完成，共形成 ${allFinalizedClusters.length} 个最终议题。`);
 
-    // --- 收尾: 格式化输出 ---
+    // --- 收尾: 格式化输出，选出每个议题的代表文章 ---
     const uniqueContenders = allFinalizedClusters.map(group => {
+        // 选出组内得分最高的文章作为代表
         const representative = _.orderBy(group, ['score'], ['desc'])[0];
         
+        // 将组内所有文章的URL和标题附加到代表文章上
         const finalRepresentative = {
             ...representative,
             clusterUrls: group.map(a => a.url),
             clusterTitles: group.map(a => a.title),
         };
 
+        // 记录日志，方便调试
         if (group.length > 1) {
             const groupTitles = group.map(a => `  - "${a.title}" (得分: ${a.score})`).join('\n');
             logger.debug(`合并了 ${group.length} 篇相似文章，选出代表: "${representative.title}"。\n该组包含:\n${groupTitles}`);
@@ -210,5 +235,6 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
         return finalRepresentative;
     });
 
+    // 最后根据代表文章的分数进行排序
     return _.orderBy(uniqueContenders, ['score'], ['desc']);
 }
