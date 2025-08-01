@@ -42,11 +42,12 @@ function robustParseLLMResponse(llmResponse) {
     return { title: newTitle, conciseSummary: finalConciseSummary, keywords: finalKeywords, category: finalCategory, detailedSummary: detailedSummary.trim() };
 }
 
+
 async function processSingleArticle(articleMeta, progressCallback = () => {}) {
-    const { title: originalTitle, content, url } = articleMeta;
+    const { title: originalTitle, content, url, isCluster } = articleMeta;
     logger.debug(`开始处理议题: 《${originalTitle}》`);
     progressCallback(`深度处理中`);
-    const { system, user } = CONFIG.prompts.processArticleSingleCall(content, originalTitle);
+    const { system, user } = CONFIG.prompts.processArticleSingleCall(content, originalTitle, isCluster);
     const llmResponse = await callLLM(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
         0.5,
@@ -75,9 +76,9 @@ async function processSingleArticle(articleMeta, progressCallback = () => {}) {
     return processedData;
 }
 
+
 /**
- * (已重构) 串行处理入选的文章议题，并保存独立报告。
- * 能自动处理单个文章和文章簇。
+ * (已重构) 串行处理入选的文章议题，计算时间加权分，并保存独立报告。
  */
 export async function processAndSummarizeArticles(articles, dailyOutputDir, progressBar) {
     if (articles.length === 0) {
@@ -111,15 +112,24 @@ export async function processAndSummarizeArticles(articles, dailyOutputDir, prog
             progressBar.update(index, { status: `[提取原文] ${shortTitle}...` });
             
             try {
-                // **核心修改**：处理文章簇
                 const isCluster = meta.clusterUrls && meta.clusterUrls.length > 1;
                 const urlsToFetch = meta.clusterUrls || [meta.url];
                 let combinedContent = '';
                 let contentCount = 0;
+                let latestDate = null;
 
                 for (const [subIndex, url] of urlsToFetch.entries()) {
-                    const { title: articleTitle, content } = await extractArticleContent(url);
-                    if (content.length > CONFIG.processing.minContentLength / urlsToFetch.length) { // 按比例降低最小长度要求
+                    const { title: articleTitle, content, date_published } = await extractArticleContent(url);
+                    
+                    // 更新为最近的发布日期
+                    if (date_published) {
+                        const articleDate = new Date(date_published);
+                        if (!latestDate || articleDate > latestDate) {
+                            latestDate = articleDate;
+                        }
+                    }
+
+                    if (content.length > CONFIG.processing.minContentLength / urlsToFetch.length) {
                         if(isCluster) {
                             combinedContent += `--- [相关文章 ${subIndex + 1}/${urlsToFetch.length}] 原始标题: ${articleTitle} ---\n\n${content}\n\n`;
                         } else {
@@ -133,8 +143,12 @@ export async function processAndSummarizeArticles(articles, dailyOutputDir, prog
                     throw new Error(`正文内容均过短, 已跳过。`);
                 }
                 
-                // 将代表文章的元数据和合并后的内容传递给处理函数
-                const articleDataForLLM = { title: meta.title, content: combinedContent, url: meta.url };
+                const articleDataForLLM = { 
+                    title: meta.title, 
+                    content: combinedContent, 
+                    url: meta.url,
+                    isCluster: isCluster 
+                };
 
                 const processedData = await processSingleArticle(articleDataForLLM, (taskName) => {
                     progressBar.update(index, { status: `[${taskName}] ${shortTitle}...` });
@@ -143,10 +157,26 @@ export async function processAndSummarizeArticles(articles, dailyOutputDir, prog
                 const safeFilename = createSafeArticleFilename(meta.rank - 1, processedData.title);
                 const articleFilePath = path.join(individualArticlesDir, safeFilename);
                 
-                // 将所有信息（原始元数据，聚类信息，LLM处理结果）合并
-                const finalResult = { ...meta, ...processedData };
+                // --- (新增) 计算新颖度得分 ---
+                let recencyBonus = 0;
+                if (latestDate) {
+                    const daysAgo = (new Date() - latestDate) / (1000 * 60 * 60 * 24);
+                    if (daysAgo >= 0 && daysAgo <= CONFIG.processing.recencyBonus.maxDays) {
+                        recencyBonus = Math.round(CONFIG.processing.recencyBonus.maxBonus * (1 - (daysAgo / CONFIG.processing.recencyBonus.maxDays)));
+                    }
+                }
 
-                // 准备独立报告的 Markdown 内容
+                const finalScore = (meta.tournamentScore || 0) + recencyBonus;
+                logger.info(`议题《${processedData.title}》 - 锦标赛得分: ${meta.tournamentScore}, 新颖度加分: ${recencyBonus}, 最终得分: ${finalScore}`);
+                
+                const finalResult = { 
+                    ...meta, 
+                    ...processedData,
+                    publishedDate: latestDate ? latestDate.toISOString().slice(0, 10) : null,
+                    recencyBonus: recencyBonus,
+                    finalScore: finalScore
+                };
+                
                 let sourceLinks = '';
                 if(isCluster) {
                     sourceLinks = finalResult.clusterUrls.map((u, i) => `- [${finalResult.clusterTitles[i]}](${u})`).join('\n');
@@ -158,7 +188,8 @@ export async function processAndSummarizeArticles(articles, dailyOutputDir, prog
 # ${finalResult.title}
 - **一句话摘要**: ${finalResult.conciseSummary || 'N/A'}
 - **核心词**: ${finalResult.keywords.join('、') || 'N/A'}
-- **重要性排名**: ${finalResult.rank} (得分: ${finalResult.tournamentScore})
+- **发布日期**: ${finalResult.publishedDate || '未知'}
+- **综合得分**: ${finalResult.finalScore} (锦标赛: ${finalResult.tournamentScore}, 新颖度: ${finalResult.recencyBonus})
 - **原文链接**: ${isCluster ? '\n' + sourceLinks : sourceLinks}
 
 ---

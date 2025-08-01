@@ -26,15 +26,15 @@ export async function fetchAndParsePage(url) {
 }
 
 /**
- * 使用Mercury Parser提取文章核心内容
+ * (已修改) 使用Mercury Parser提取文章核心内容和发布日期
  * @param {string} url - 文章URL
- * @returns {Promise<{title: string, content: string}>} - 包含标题和纯文本内容的对象
+ * @returns {Promise<{title: string, content: string, date_published: string | null}>} - 包含标题、纯文本内容和发布日期的对象
  * @throws 如果内容提取失败，则抛出错误
  */
 export async function extractArticleContent(url) {
     try {
         const result = await Mercury.parse(url, { headers: CONFIG.network.headers });
-        if (!result) return { title: '无标题', content: '' };
+        if (!result) return { title: '无标题', content: '', date_published: null };
 
         // 将HTML内容转换为纯文本
         const plainTextContent = result.content
@@ -44,12 +44,14 @@ export async function extractArticleContent(url) {
         return {
             title: result.title || '无标题',
             content: plainTextContent,
+            date_published: result.date_published // 新增：返回发布日期
         };
     } catch (error) {
         logger.error(`Mercury parser 在此URL失败: ${url}`, { message: error.message });
         throw new Error(`内容提取失败 ${url}: ${error.message}`);
     }
 }
+
 
 /**
  * 调用大语言模型 (LLM) API
@@ -67,20 +69,25 @@ export async function callLLM(messages, temperature, timeout) {
         stream: false
     };
 
-    logger.debug('LLM Request Start', { url: CONFIG.llm.studioUrl });
-    logger.debug('LLM Request Body:', { prompt: messages.slice(-1)[0].user });
+    if (CONFIG.debugMode) {
+        logger.debug('LLM Request Start', { url: CONFIG.llm.studioUrl });
+        logger.debug('LLM Request Body:', { prompt: messages.slice(-1)[0].user });
+    }
 
-    for (let i = 0; i < CONFIG.llm.maxRetries; i++) {
+
+    for (let i = 0; i < CONFIG.llm.maxRetries + 1; i++) {
         try {
             const response = await axios.post(CONFIG.llm.studioUrl, body, {
                 timeout: timeout || CONFIG.llm.requestTimeout
             });
             const content = response.data.choices[0].message.content.trim();
-            logger.debug('LLM Request Success', { response: content });
+            if (CONFIG.debugMode) {
+                logger.debug('LLM Request Success', { response: content });
+            }
             return content;
         } catch (error) {
             logger.warn(`LLM调用在第 ${i + 1} 次尝试时失败`, { error: error.message });
-            if (i === CONFIG.llm.maxRetries - 1) {
+            if (i === CONFIG.llm.maxRetries) {
                 throw new Error(`LLM调用失败 (已达最大重试次数): ${error.message}`);
             }
             await new Promise(res => setTimeout(res, CONFIG.llm.retryDelay * (i + 1)));
