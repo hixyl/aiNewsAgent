@@ -4,103 +4,114 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 // --- ES Module 环境下的 __dirname ---
+// 获取当前文件的完整路径
 const __filename = fileURLToPath(import.meta.url);
+// 获取当前文件所在目录的路径
 const __dirname = path.dirname(__filename);
 
 /**
  * @description 应用程序的核心配置对象
  */
 const CONFIG = {
-    // 任务定义
+    // 任务定义: 描述AI代理的核心任务，这个描述会贯穿始终，影响AI在排名、总结等环节的决策
     taskDescription: '为中国大陆的读者提供一份关于国家重要新闻的每日简报。',
+    // 起始URL: AI代理将从这个网址开始抓取新闻
     startUrl: 'https://www.news.cn/',
 
     // 调试与输出
-    debugMode: false, // 设置为 true 可在控制台看到详细的 LLM 请求日志
-    outputBaseDir: path.join(__dirname, 'output'),
+    debugMode: false, // 设为true时，控制台会打印详细的LLM请求和响应日志，方便调试
+    outputBaseDir: path.join(__dirname, 'output'), // 所有输出文件（报告、日志等）的基础目录
 
-    // 网络相关
+    // 网络相关配置
     network: {
+        // 请求头: 模拟浏览器访问，防止被网站屏蔽
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
         },
-        fetchTimeout: 20000, // 页面抓取超时时间 (ms)
+        // 页面抓取超时时间 (毫秒)
+        fetchTimeout: 20000,
     },
 
-    // 爬取与链接筛选
+    // 爬取与链接筛选配置
     crawling: {
-        maxDepth: 2, // 爬取最大深度
-        maxCategoriesToExplore: 12, // 在每个深度，从识别出的栏目中，选出最重要的N个进行下一步探索
-        categoryRankingGroupSize: 10, // 栏目排名时，每组比较的栏目数量
-        categoryRankingPoints: [5, 3, 2, 1, 0], // 栏目排名得分
+        maxDepth: 2, // 爬虫探索的最大深度，从startUrl开始为1
+        maxCategoriesToExplore: 12, // 在每一层深度，最多选择N个最重要的“栏目”进行深入探索
+        categoryRankingGroupSize: 10, // 对栏目进行重要性排名时，每组比较的栏目数量
+        categoryRankingPoints: [5, 3, 2, 1, 0], // LLM对栏目排名后，根据名次赋予的分数
+        // 无用标题关键词: 包含这些词的链接标题会被直接忽略，以过滤掉“关于我们”、“联系我们”等非新闻链接
         uselessTitleKeywords: ['关于我们', '联系我们', '隐私政策', '登录', '注册', '下载', '更多', '广告', '订阅'],
     },
 
-    // 锦标赛排名配置
+    // 锦标赛排名系统配置
     ranking: {
         // --- 资格赛配置 ---
-        qualificationRounds: 2,
-        qualificationGroupSize: 10,
-        qualificationTopN: 3,
-        qualificationPoints: [5, 3, 2, 1, 0],
-        qualificationConcurrency: 10,
+        qualificationRounds: 4, // 进行多少轮资格赛
+        qualificationGroupSize: 5, // 资格赛中，每组比较的文章数量
+        qualificationTopN: 3, // (此项在当前代码逻辑中已不直接使用，分数制取代了TopN晋级)
+        qualificationPoints: [5, 3, 2, 1, 0], // 资格赛中，LLM给出排名后，根据名次赋予的分数
+        qualificationConcurrency: 10, // 资格赛期间，同时向LLM发送请求的并发数
 
         // --- (新) 稳健聚类配置 ---
-        groupingBatchSize: 25,     // 阶段一和二中，每批处理的文章数量
-        maxGroupingCycles: 3,      // 聚类过程的最大迭代轮次，防止无限循环
+        groupingBatchSize: 10, // 在文章聚类的各个阶段，每批次处理的文章数量
+        maxGroupingCycles: 5, // 聚类过程的最大迭代次数，防止因逻辑问题陷入无限循环
 
         // --- 决赛圈配置 ---
-        contendersToRank: 60,
-        tournamentRounds: 3,
-        tournamentGroupSize: 3,
-        tournamentPoints: [3, 1, 0],
-        tournamentConcurrency: 8,
+        contendersToRank: 80, // 从资格赛中选出排名前N的文章进入决赛圈
+        tournamentRounds: 5, // 进行多少轮决赛圈排名
+        tournamentGroupSize: 3, // 决赛圈中，每组比较的文章数量（瑞士制，分数相近的在一起比较）
+        tournamentPoints: [3, 1, 0], // 决赛圈排名后，根据名次赋予的分数
+        tournamentConcurrency: 8, // 决赛圈期间，同时向LLM发送请求的并发数
     },
 
-    // 文章处理
+    // 文章处理配置
     processing: {
-        maxArticlesToProcess: 15,
-        minContentLength: 60,
-        maxOverallRetries: 5,
+        maxArticlesToProcess: 20, // 决赛圈结束后，最终选出N篇文章进行深度总结和处理
+        minContentLength: 60, // 从网页提取正文时，如果内容字数少于此值，则认为提取失败
+        maxOverallRetries: 5, // 对单篇文章或议题进行深度处理时，最大允许的重试次数
+        // 新颖度加分策略: 对近期发布的文章给予额外加分
         recencyBonus: {
-            maxBonus: 20,
-            maxDays: 7,
+            maxBonus: 20, // 最高可获得的新颖度加分
+            maxDays: 7, // 只对最近N天内的文章进行加分
         }
     },
 
-    // 大语言模型 (LLM)
+    // 大语言模型 (LLM) 相关配置
     llm: {
-        studioUrl: 'http://localhost:1234/v1/chat/completions',
-        maxRetries: 1,
-        retryDelay: 1000,
-        requestTimeout: 120000,
-        longRequestTimeout: 300000,
-        maxTokens: 999999,
+        studioUrl: 'http://localhost:1234/v1/chat/completions', // 指向你的本地LLM服务地址（需兼容OpenAI API格式）
+        maxRetries: 1, // 单次LLM API调用失败后的最大重试次数
+        retryDelay: 1000, // 每次重试前的基础延迟时间 (毫秒)
+        requestTimeout: 120000, // 普通LLM请求的超时时间 (毫秒, 2分钟)
+        longRequestTimeout: 300000, // 长请求（如深度总结）的超时时间 (毫秒, 5分钟)
+        maxTokens: 999999, // LLM生成的最大token数，可以设置得大一些以防内容被截断
     },
 
-    // 输出格式化
+    // 输出格式化配置
     output: {
+        // 为不同分类配置Emoji图标，用于美化最终的Markdown报告
         categoryEmojis: { '国际': '🌍', '国内': '🇨🇳', '财经': '💼', '科技': '🔬', '社会': '👥', '观点': '✍️', '其他': '📰', '默认': '📰' }
     },
 
-    // Prompt 模板中心
+    // Prompt 模板中心: 集中管理所有与LLM交互的Prompt
     prompts: {
+        // 用于资格赛，对文章标题进行重要性排序
         qualifyLinks: (linkTitles, taskDescription) => ({
             system: '你是一位反应迅速、判断精准的新闻编辑，任务是快速判断在一组新闻标题中，哪些对目标读者最重要。你的回应必须极端简洁，严格遵循格式。内容使用简体中文。',
             user: `**任务目标**: “${taskDescription}”\n\n**待评估的标题列表**:\n${linkTitles.map((title, i) => `${i + 1}. ${title}`).join('\n')}\n\n**你的指令**:\n根据任务目标，对列表中的标题进行重要性排序。你的回应【只能】是标题的【编号】，从最重要到最不重要排列，并用英文逗号 (,) 分隔。不要包含任何理由、解释或多余的文字。\n\n**格式示例**: 3,1,2,5,4\n\n**你的回应**:`,
         }),
 
+        // 用于对抓取到的“栏目”链接进行重要性排序
         rankCategories: (categoryTitles, taskDescription) => ({
             system: '你是一位经验丰富的新闻网站总编辑，任务是判断在一组“新闻栏目”中，哪些对于目标读者来说最有可能包含重要新闻,比较好的栏目名类似于[财经][科技][国际][亚洲新闻]这种,不好的栏目名类似于[中国政府网][公司官网][联系我们]这种,如果你认为这个栏目可能会指向别的网站,排序就放到后面。你的回应必须极端简洁，严格遵循格式。内容使用简体中文。',
             user: `**任务目标**: “${taskDescription}”\n\n**待评估的“栏目”标题列表**:\n${categoryTitles.map((title, i) => `${i + 1}. ${title}`).join('\n')}\n\n**你的指令**:\n根据任务目标，对列表中的栏目标题进行重要性排序。你的回应【只能】是栏目的【编号】，从最重要到最不重要排列，并用英文逗号 (,) 分隔。不要包含任何理由、解释或多余的文字。\n\n**格式示例**: 3,1,2,5,4\n\n**你的回应**:`,
         }),
         
+        // 用于判断一个链接指向的是文章页还是栏目页
         classifyLinkType: (linkTitle) => ({
             system: '你是一个链接分类工具，任务是判断一个链接标题指向的是“文章页面”还是“栏目列表页面”。你的回应必须是单个词。内容使用简体中文。',
             user: `请判断以下链接标题更可能是一个具体的新闻“文章”（article）还是一个新闻“栏目”（category）。\n标题：“${linkTitle}”\n\n你的回应只能是 "article" 或 "category"。\n\n回应:`,
         }),
         
-        // (新) 聚类第一步：找出高度相似的配对
+        // (新) 聚类第一步：找出高度相似的标题对
         findSimilarPairs: (articles) => ({
             system: '你是一个高精度的文本匹配工具。你的任务是在一个标题列表中，找出那些报道【完全相同核心事件】的标题对。你的回应必须极端简洁，严格遵循格式。',
             user: `
@@ -129,7 +140,7 @@ ${articles.map((art, i) => `ID_${i}: "${art.title}"`).join('\n')}
 `
         }),
 
-        // (新) 聚类第二步：将候选者与已有的代表簇进行匹配
+        // (新) 聚类第二步：将候选文章与已有的代表性议题进行匹配
         groupAgainstRepresentatives: (representatives, candidates) => ({
             system: '你是一个新闻分类引擎。你的任务是判断一批“待分类文章”是否与已有的“代表性议题”在核心事件上相同。你的回应必须是一个纯粹的、格式完美的JSON对象。',
             user: `
@@ -160,7 +171,7 @@ ${candidates.map((cand, i) => `C_${i}: "${cand.title}"`).join('\n')}
 `
         }),
         
-        // (复用) 聚类第三步（可选）：验证簇内部的一致性
+        // (复用) 聚类第三步（可选）：验证一个簇内的所有标题是否都与主题一致
         verifyClusterConsistency: (theme, titles) => ({
             system: '你是一个严谨的内容审核员，负责检验一组新闻标题是否都严格符合给定的核心议题。你的回应必须极端简洁，严格遵循格式。内容使用简体中文。',
             user: `**核心议题**: "${theme}"
@@ -179,7 +190,7 @@ ${titles.map((title, i) => `${i + 1}. "${title}"`).join('\n')}
 **你的回应**:`,
         }),
         
-        // (复用) 为最终的簇生成一个精炼的主题
+        // (复用) 为最终合并的议题（簇）生成一个精炼的核心主题名称
         generateClusterTheme: (titles) => ({
             system: '你是一位顶级的议题分析师，擅长从一组相似的新闻标题中，提炼出最核心、最精炼的议题名称。你的回应必须极端简洁。内容使用简体中文。',
             user: `**任务**: 根据以下新闻标题列表，生成一个不超过15个字的、高度概括的“议题名称”。
@@ -194,12 +205,13 @@ ${titles.map(title => `- "${title}"`).join('\n')}
 **你的回应**:`,
         }),
 
-
+        // 用于决赛圈，对入围的文章进行最终的重要性排序
         rankContenders: (articles, taskDescription) => ({
             system: '你是一位顶级的、拥有宏观视野,视角全面且客观的总编辑，任务是判断在一组新闻中，哪些对于目标读者最重要、最具有新闻价值。你的判断必须果断、精准，且严格遵循输出格式。内容使用简体中文。',
             user: `**任务目标**: “${taskDescription}”\n\n**待排名新闻列表**:\n${articles.map((a, i) => `${i + 1}. ${a.title}`).join('\n')}\n\n**你的指令**:\n请根据上述任务目标，对列表中的新闻进行重要性排序。你的回应【只能】是新闻的【编号】，从最重要到最不重要排列，并用英文逗号 (,) 分隔。不要包含任何理由、解释或多余的文字。\n\n**格式示例**: 3,1,2\n\n**你的回应**:`,
         }),
         
+        // 用于对单篇文章或议题进行深度处理，生成标题、摘要、关键词等
         processArticleSingleCall: (articleContent, originalTitle, isCluster = false) => ({
             system: '你是一位顶尖的新闻分析师和内容创作者，擅长从海量信息中提炼价值、深度解读，并以专业且亲民的语言呈现。你的输出必须是一个纯粹、格式完美的JSON对象。',
             user: `
@@ -234,6 +246,7 @@ ${articleContent}
 `
         }),
         
+        // 用于生成每日简报开头的“总编导语”
         generateEditorIntro: (conciseSummariesText) => ({
             system: '你是一位视野宏大、洞察力敏锐、文笔老练的资深总编辑。你的任务是为今日的新闻简报撰写一段画龙点睛的开篇导语。',
             user: `**任务**: 基于以下今日核心新闻的一句话摘要，撰写一段约200-300字的“总编导语”。
