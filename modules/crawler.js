@@ -41,8 +41,8 @@ async function rankAndSelectCategories(categories) {
             }
             try {
                 const groupTitles = group.map(cat => cat.title);
-                const groupLink = group.map(cat => cat.url);
-                const { system, user } = CONFIG.prompts.rankCategories(`${groupTitles}\n${groupLink}\n\n`, CONFIG.taskDescription);
+                const groupLinks = group.map(cat => cat.url);
+                const { system, user } = CONFIG.prompts.rankCategories(groupTitles, CONFIG.taskDescription);
                 const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
 
                 const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
