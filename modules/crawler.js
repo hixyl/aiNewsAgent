@@ -8,50 +8,79 @@ import logger from '../utils/logger.js';
 import { fetchAndParsePage, callLLM } from '../services/network.js';
 
 /**
- * (新增) 对发现的栏目链接进行排名，并选出最重要的栏目。
+ * (已重构) 通过多轮瑞士制对发现的栏目链接进行排名，选出最重要的栏目。
  * @param {Array<object>} categories - 栏目链接对象列表
  * @returns {Promise<Array<object>>} - 按重要性得分排序后的栏目列表
  */
 async function rankAndSelectCategories(categories) {
-    const { categoryRankingGroupSize, categoryRankingPoints } = CONFIG.crawling;
-    const limit = pLimit(CONFIG.ranking.qualificationConcurrency); // 复用资格赛的并发设置
-
+    const { categoryRankingRounds, categoryRankingGroupSize, categoryRankingPoints } = CONFIG.crawling;
+    // 复用资格赛的并发设置
+    const limit = pLimit(CONFIG.ranking.qualificationConcurrency);
     let categoriesWithScores = categories.map(cat => ({ ...cat, score: 0 }));
 
-    const groups = _.chunk(_.shuffle(categoriesWithScores), categoryRankingGroupSize);
+    logger.info(`开始对 ${categories.length} 个栏目进行 ${categoryRankingRounds} 轮瑞士制排名...`);
 
-    const rankingPromises = groups.map(group => limit(async () => {
-        try {
-            const groupTitles = group.map(cat => cat.title);
-            const { system, user } = CONFIG.prompts.rankCategories(groupTitles, CONFIG.taskDescription);
-            const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
+    for (let round = 1; round <= categoryRankingRounds; round++) {
+        // 第一轮随机分组，后续轮次按分数高低分组
+        const categoriesToRank = round === 1 
+            ? _.shuffle(categoriesWithScores) 
+            : _.orderBy(categoriesWithScores, ['score'], ['desc']);
 
-            const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
+        const groups = _.chunk(categoriesToRank, categoryRankingGroupSize);
 
-            rankedIndices.forEach((originalIndex, rank) => {
-                const categoryInGroup = group[originalIndex];
-                if (categoryInGroup && categoryRankingPoints[rank] !== undefined) {
-                    // 找到主列表中的对象并更新分数
-                    const targetCategory = categoriesWithScores.find(c => c.url === categoryInGroup.url);
-                    if (targetCategory) {
-                        targetCategory.score += categoryRankingPoints[rank];
+        const rankingPromises = groups.map(group => limit(async () => {
+            if (group.length < 2) { // 如果小组内少于2个，则不进行比较
+                if (group.length === 1) {
+                    // 对于只有一个成员的小组，可以给予一个基础的“参与分”
+                    const targetCategory = categoriesWithScores.find(c => c.url === group[0].url);
+                    if (targetCategory && categoryRankingPoints.length > 1) {
+                        targetCategory.score += categoryRankingPoints[1]; // 比如给予第二名的分数
                     }
                 }
-            });
-        } catch (error) {
-            logger.warn('栏目小组排名失败', { error: error.message });
-        }
-    }));
+                return;
+            }
+            try {
+                const groupTitles = group.map(cat => cat.title);
+                const { system, user } = CONFIG.prompts.rankCategories(groupTitles, CONFIG.taskDescription);
+                const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
 
-    await Promise.all(rankingPromises);
+                const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
 
+                // 确保LLM返回的索引数量和小组大小匹配，如果不匹配则跳过，防止出错
+                if (rankedIndices.length !== group.length) {
+                    logger.warn('栏目排名返回的索引数量与小组规模不匹配，跳过此小组。', {
+                        expected: group.length,
+                        received: rankedIndices.length,
+                        response: responseText,
+                    });
+                    return;
+                }
+
+                rankedIndices.forEach((originalIndex, rank) => {
+                    const categoryInGroup = group[originalIndex];
+                    if (categoryInGroup && categoryRankingPoints[rank] !== undefined) {
+                        // 找到主列表中的对象并更新分数
+                        const targetCategory = categoriesWithScores.find(c => c.url === categoryInGroup.url);
+                        if (targetCategory) {
+                            targetCategory.score += categoryRankingPoints[rank];
+                        }
+                    }
+                });
+            } catch (error) {
+                logger.warn(`栏目小组排名失败 (第 ${round} 轮)`, { error: error.message });
+            }
+        }));
+
+        await Promise.all(rankingPromises);
+        logger.info(`栏目排名第 ${round}/${categoryRankingRounds} 轮完成。`);
+    }
+    logger.info(`所有栏目排名轮次完成。`);
     return _.orderBy(categoriesWithScores, ['score'], ['desc']);
 }
 
 
 /**
- * (已重构) 发现文章链接并通过多轮瑞士制资格赛筛选出候选者。
- * 不再是简单的分组淘汰，而是通过多轮比拼和积分，更公平地选出优胜者。
+ * 发现文章链接并通过多轮瑞士制资格赛筛选出候选者。
  * @param {import('ora').Ora} spinner - Ora微调器实例，用于显示状态
  * @param {import('cli-progress').SingleBar} progressBar - 进度条实例
  * @returns {Promise<Array<object>>} - 通过资格赛的候选文章元数据列表
@@ -98,7 +127,11 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                             if (type.includes('article')) {
                                 allFoundLinks.set(canonicalUrl, { url: canonicalUrl, title: linkTitle, type: 'article' });
                             } else if (type.includes('category') && currentPage.depth < CONFIG.crawling.maxDepth) {
-                                newCategoryPages.push({ url: canonicalUrl, title: linkTitle, type: 'category' });
+                                // 使用去重后的栏目URL作为唯一标识
+                                const existingCategory = newCategoryPages.find(p => p.url === canonicalUrl);
+                                if (!existingCategory) {
+                                    newCategoryPages.push({ url: canonicalUrl, title: linkTitle, type: 'category' });
+                                }
                             }
                         }
                     } catch (e) { /* 忽略无效URL */ }
@@ -156,6 +189,15 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                 const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
 
                 const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
+                
+                if (rankedIndices.length !== group.length) {
+                    logger.warn('文章资格赛排名返回的索引数量与小组规模不匹配，跳过此小组。', {
+                        expected: group.length,
+                        received: rankedIndices.length,
+                        response: responseText,
+                    });
+                    return;
+                }
 
                 rankedIndices.forEach((originalIndex, rank) => {
                     const articleInGroup = group[originalIndex];

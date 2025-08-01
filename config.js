@@ -16,7 +16,7 @@ const CONFIG = {
     // 任务定义: 描述AI代理的核心任务，这个描述会贯穿始终，影响AI在排名、总结等环节的决策
     taskDescription: '为中国大陆的读者提供一份关于国家重要新闻的每日简报。',
     // 起始URL: AI代理将从这个网址开始抓取新闻
-    startUrl: 'https://www.news.cn/',
+    startUrl: 'https://www.163.com/',
 
     // 调试与输出
     debugMode: false, // 设为true时，控制台会打印详细的LLM请求和响应日志，方便调试
@@ -26,7 +26,7 @@ const CONFIG = {
     network: {
         // 请求头: 模拟浏览器访问，防止被网站屏蔽
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         },
         // 页面抓取超时时间 (毫秒)
         fetchTimeout: 20000,
@@ -34,9 +34,11 @@ const CONFIG = {
 
     // 爬取与链接筛选配置
     crawling: {
-        maxDepth: 5, // 爬虫探索的最大深度，从startUrl开始为1
-        maxCategoriesToExplore: 2, // 在每一层深度，最多选择N个最重要的“栏目”进行深入探索
-        categoryRankingGroupSize: 10, // 对栏目进行重要性排名时，每组比较的栏目数量
+        maxDepth: 2, // 爬虫探索的最大深度，从startUrl开始为1
+        maxCategoriesToExplore: 6, // 在每一层深度，最多选择N个最重要的“栏目”进行深入探索
+        // --- (新增) 栏目排名配置 ---
+        categoryRankingRounds: 3, // **(新增)** 为确保公平性，对栏目进行多少轮瑞士制排名
+        categoryRankingGroupSize: 5, // 对栏目进行重要性排名时，每组比较的栏目数量
         categoryRankingPoints: [5, 3, 2, 1, 0], // LLM对栏目排名后，根据名次赋予的分数
         // 无用标题关键词: 包含这些词的链接标题会被直接忽略，以过滤掉“关于我们”、“联系我们”等非新闻链接
         uselessTitleKeywords: ['关于我们', '联系我们', '隐私政策', '登录', '注册', '下载', '更多', '广告', '订阅'],
@@ -45,10 +47,10 @@ const CONFIG = {
     // 锦标赛排名系统配置
     ranking: {
         // --- 资格赛配置 ---
-        qualificationRounds: 4, // 进行多少轮资格赛
-        qualificationGroupSize: 5, // 资格赛中，每组比较的文章数量
+        qualificationRounds: 2, // 进行多少轮资格赛
+        qualificationGroupSize: 6, // 资格赛中，每组比较的文章数量
         qualificationTopN: 3, // (此项在当前代码逻辑中已不直接使用，分数制取代了TopN晋级)
-        qualificationPoints: [5, 3, 2, 1, 0], // 资格赛中，LLM给出排名后，根据名次赋予的分数
+        qualificationPoints: [6, 5, 3, 2, 1, 0], // 资格赛中，LLM给出排名后，根据名次赋予的分数
         qualificationConcurrency: 10, // 资格赛期间，同时向LLM发送请求的并发数
 
         // --- (新) 聚类配置 ---
@@ -67,7 +69,7 @@ const CONFIG = {
 
     // 文章处理配置
     processing: {
-        maxArticlesToProcess: 20, // 决赛圈结束后，最终选出N篇文章进行深度总结和处理
+        maxArticlesToProcess: 15, // 决赛圈结束后，最终选出N篇文章进行深度总结和处理
         minContentLength: 60, // 从网页提取正文时，如果内容字数少于此值，则认为提取失败
         maxOverallRetries: 5, // 对单篇文章或议题进行深度处理时，最大允许的重试次数
         // 新颖度加分策略: 对近期发布的文章给予额外加分
@@ -103,7 +105,7 @@ const CONFIG = {
 
         // 用于对抓取到的“栏目”链接进行重要性排序
         rankCategories: (categoryTitles, taskDescription) => ({
-            system: '你是一位经验丰富的新闻网站总编辑，任务是判断在一组“新闻栏目”中，哪些对于目标读者来说最有可能包含重要新闻,比较好的栏目名类似于[财经][科技][国际][亚洲新闻]这种,即名字就像是一个网站的子栏目,不好的栏目名类似于[中国政府网][公司官网][联系我们]这种,如果你认为这个栏目可能会指向别的网站(比如名字就叫(外交部,或者新浪网)),排序就放到后面。你的回应必须极端简洁，严格遵循格式。内容使用简体中文。',
+            system: '你是一位经验丰富的新闻网站总编辑，任务是判断在一组“新闻栏目”中，哪些对于目标读者来说最有可能包含重要新闻的栏目,如果你觉得不是新闻栏目(分类),排名要靠后,比较好的栏目名类似于[财经][科技][国际][亚洲新闻]这种,即名字就像是一个网站的子栏目,不好的栏目名类似于[中国政府网][公司官网][联系我们]这种,如果你认为这个栏目可能会指向别的网站(比如名字就叫(外交部,或者新浪网)),排序就放到后面。你的回应必须极端简洁，严格遵循格式。内容使用简体中文。',
             user: `**任务目标**: “${taskDescription}”\n\n**待评估的“栏目”标题列表**:\n${categoryTitles.map((title, i) => `${i + 1}. ${title}`).join('\n')}\n\n**你的指令**:\n根据任务目标，对列表中的栏目标题进行重要性排序。你的回应【只能】是栏目的【编号】，从最重要到最不重要排列，并用英文逗号 (,) 分隔。不要包含任何理由、解释或多余的文字。\n\n**格式示例**: 3,1,2,5,4\n\n**你的回应**:`,
         }),
         
@@ -124,6 +126,7 @@ const CONFIG = {
 - **实体一致**: 涉及同一个国家、同一家公司、同一位关键人物等。
 - **事件性质一致**: 都是关于某次会议、某项政策发布、某场自然灾害、某个科技突破等。
 - **忽略措辞和角度差异**: 例如，“A国与B国发生边境冲突” 和 “B国国防部谴责A国军队的挑衅行为” 应被视为同一事件。
+以上三者必须完全满足,才能视为同一事件,如果主体不一致,比如[俄乌战争]和[巴以冲突]不能被归为一类.但是[俄乌战争中,俄罗斯袭击基辅]和[基辅被俄罗斯袭击],视为一类.
 
 **# 文章列表**
 ${articles.map((art, i) => `ID_${i}: "${art.title}"`).join('\n')}
