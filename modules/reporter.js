@@ -10,8 +10,9 @@ import { callLLM } from '../services/network.js';
 import _ from 'lodash'; 
 
 /**
- * 根据处理好的文章数据，生成最终的Markdown简报
- * @param {Array<object>} articles - 已处理并包含所有元数据的文章列表
+ * (已修改) 根据处理好的文章数据，生成最终的Markdown简报。
+ * 能正确处理包含文章簇的议题。
+ * @param {Array<object>} articles - 已处理并包含所有元数据的文章/议题列表
  * @param {string} dailyOutputDir - 当日输出目录
  * @param {import('ora').Ora} spinner - Ora微调器实例
  * @returns {Promise<object|null>} - 包含报告路径的对象，或在无文章时返回null
@@ -23,10 +24,8 @@ export async function generateFinalReport(articles, dailyOutputDir, spinner) {
         return null;
     }
 
-    // 在生成报告前，根据锦标赛得分对所有成功处理的文章进行最终排序，确保顺序与重要性一致。
-    // 使用 lodash 的 orderBy 可以稳定地处理排序。
     const sortedArticles = _.orderBy(articles, ['tournamentScore'], ['desc']);
-    logger.info(`已根据最终重要性得分对 ${articles.length} 篇成功处理的文章完成排序。`);
+    logger.info(`已根据最终重要性得分对 ${articles.length} 篇成功处理的议题完成排序。`);
 
     spinner.start('AI正在撰写总编导语...');
     const today = new Date().toISOString().slice(0, 10);
@@ -51,17 +50,13 @@ export async function generateFinalReport(articles, dailyOutputDir, spinner) {
     let finalMarkdown = `# 每日新闻简报 (${today})\n\n`;
     finalMarkdown += `> **总编导语**\n> ${editorIntroduction.replace(/\n/g, '\n> ')}\n\n---\n\n`;
 
-    // 生成目录
     finalMarkdown += `### **目录 (Table of Contents)**\n`;
     sortedArticles.forEach((article, index) => {
-        // 使用LLM生成的新标题
         finalMarkdown += `${index + 1}. [${getCategoryEmoji(article.category)}【${article.category}】${article.title}](#${index + 1})\n`;
     });
     finalMarkdown += `\n---\n\n`;
 
-    // 生成正文
     for (const [index, article] of sortedArticles.entries()) {
-        // 使用LLM生成的新标题
         finalMarkdown += `### <a id="${index + 1}"></a> ${index + 1}. ${getCategoryEmoji(article.category)}【${article.category}】${article.title}\n\n`;
         finalMarkdown += `* **一句话摘要**: ${article.conciseSummary}\n`;
         finalMarkdown += `* **重要性排名**: ${article.rank} (锦标赛得分: ${article.tournamentScore})\n`;
@@ -71,7 +66,16 @@ export async function generateFinalReport(articles, dailyOutputDir, spinner) {
             finalMarkdown += `\n`;
         }
         finalMarkdown += `#### **详细内容**\n${article.detailedSummary}\n\n`;
-        finalMarkdown += `[阅读原文](${article.url})\n\n---\n\n`;
+
+        // **核心修改**: 优雅地处理原文链接，区分单个文章和文章簇
+        const isCluster = article.clusterUrls && article.clusterUrls.length > 1;
+        if (isCluster) {
+            finalMarkdown += `**相关原文链接**:\n`;
+            finalMarkdown += article.clusterUrls.map((url, i) => `- [${article.clusterTitles[i]}](${url})`).join('\n') + '\n\n';
+        } else {
+            finalMarkdown += `[阅读原文](${article.url})\n\n`;
+        }
+        finalMarkdown += `---\n\n`;
     }
 
     const reportFileName = `News-Briefing-${today}.md`;

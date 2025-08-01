@@ -24,10 +24,11 @@ async function getKeywordsForTitle(title) {
 }
 
 /**
- * 对文章进行聚类和去重。
+ * (已修改) 对文章进行聚类和去重。
+ * 不再丢弃同组文章，而是将整个组的信息附加到得分最高的代表文章上。
  * @param {Array<object>} articles - 候选文章列表。
  * @param {import('cli-progress').SingleBar} progressBar - 进度条实例。
- * @returns {Promise<Array<object>>} - 去重后的文章列表。
+ * @returns {Promise<Array<object>>} - 去重后的文章列表，其中每个文章对象都可能包含一个文章簇的信息。
  */
 export async function groupAndDeduplicateArticles(articles, progressBar) {
     if (articles.length === 0) {
@@ -61,10 +62,8 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     let remainingArticles = [...articlesWithKeywords];
 
     while (remainingArticles.length > 0) {
-        // 从剩余文章中取出第一篇作为“种子”
         const seedArticle = remainingArticles.shift();
         
-        // 如果种子文章没有关键词，它自己成为一个独立的组
         if (!seedArticle.keywords || seedArticle.keywords.length === 0) {
             groups.push([seedArticle]);
             continue;
@@ -73,16 +72,12 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
         const currentGroup = [seedArticle];
         const seedKeywords = new Set(seedArticle.keywords);
 
-        // 从后向前遍历剩余文章，以安全地在循环中删除元素
         for (let i = remainingArticles.length - 1; i >= 0; i--) {
             const targetArticle = remainingArticles[i];
-            
-            // 检查目标文章的关键词是否与种子文章的关键词有交集
             const hasSharedKeyword = targetArticle.keywords.some(kw => seedKeywords.has(kw));
 
             if (hasSharedKeyword) {
                 currentGroup.push(targetArticle);
-                // 将已分组的文章从剩余列表中移除
                 remainingArticles.splice(i, 1);
             }
         }
@@ -92,21 +87,23 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     logger.info(`已将 ${articles.length} 篇文章聚类成 ${groups.length} 个独立议题。`);
     console.log(chalk.green(`聚类分析完成，共形成 ${groups.length} 个独立新闻议题。`));
 
-    // 步骤 3: 从每个组中选出得分最高的代表
+    // 步骤 3: 从每个组中选出代表，并附加整个组的信息
     const uniqueContenders = groups.map(group => {
-        // 如果组内只有一篇文章，直接返回它
-        if (group.length === 1) {
-            // 使用 alodash.omit 移除临时的 keywords 属性
-            return _.omit(group[0], 'keywords');
-        }
-        
-        // 如果组内有多篇相似文章，选出在资格赛中得分最高的作为代表
         const representative = _.orderBy(group, ['score'], ['desc'])[0];
         
-        const groupTitles = group.map(a => `  - "${a.title}" (得分: ${a.score})`).join('\n');
-        logger.debug(`合并了 ${group.length} 篇相似文章，选出代表: "${representative.title}"。\n该组包含:\n${groupTitles}`);
+        // **核心修改**：将组内所有文章的URL和标题附加到代表文章上
+        const finalRepresentative = {
+            ..._.omit(representative, 'keywords'), // 从最终对象中移除临时的 keywords 属性
+            clusterUrls: group.map(a => a.url),
+            clusterTitles: group.map(a => a.title),
+        };
+
+        if (group.length > 1) {
+            const groupTitles = group.map(a => `  - "${a.title}" (得分: ${a.score})`).join('\n');
+            logger.debug(`合并了 ${group.length} 篇相似文章，选出代表: "${representative.title}"。\n该组包含:\n${groupTitles}`);
+        }
         
-        return _.omit(representative, 'keywords');
+        return finalRepresentative;
     });
 
     // 按资格赛分数对最终选出的代表们进行一次排序
