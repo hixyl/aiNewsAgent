@@ -16,7 +16,7 @@ const CONFIG = {
     // 任务定义: 描述AI代理的核心任务，这个描述会贯穿始终，影响AI在排名、总结等环节的决策
     taskDescription: '为中国大陆的读者提供一份关于国家重要新闻的每日简报。',
     // 起始URL: AI代理将从这个网址开始抓取新闻
-    startUrl: 'https://www.163.com/',
+    startUrl: 'https://www.news.cn/',
 
     // 调试与输出
     debugMode: false, // 设为true时，控制台会打印详细的LLM请求和响应日志，方便调试
