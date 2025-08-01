@@ -41,7 +41,8 @@ async function rankAndSelectCategories(categories) {
             }
             try {
                 const groupTitles = group.map(cat => cat.title);
-                const { system, user } = CONFIG.prompts.rankCategories(groupTitles, CONFIG.taskDescription);
+                const groupLink = group.map(cat => cat.url);
+                const { system, user } = CONFIG.prompts.rankCategories(`${groupTitles}\n${groupLink}\n\n`, CONFIG.taskDescription);
                 const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
 
                 const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
@@ -121,7 +122,7 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                             !visitedUrls.has(canonicalUrl)) {
                             
                             visitedUrls.add(canonicalUrl);
-                            const { system, user } = CONFIG.prompts.classifyLinkType(linkTitle);
+                            const { system, user } = CONFIG.prompts.classifyLinkType(linkTitle, linkUrl);
                             const type = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.1);
 
                             if (type.includes('article')) {
