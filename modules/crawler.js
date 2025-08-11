@@ -13,7 +13,7 @@ import { fetchAndParsePage, callLLM } from '../services/network.js';
  * @returns {Promise<Array<object>>} - 按重要性得分排序后的栏目列表
  */
 async function rankAndSelectCategories(categories) {
-    const { categoryRankingRounds, categoryRankingGroupSize, categoryRankingPoints } = CONFIG.crawling;
+    const { categoryRankingRounds, categoryRankingGroupSize, categoryRankingPoints, llmRetries, retryDelay } = CONFIG.crawling;
     // 复用资格赛的并发设置
     const limit = pLimit(CONFIG.ranking.qualificationConcurrency);
     let categoriesWithScores = categories.map(cat => ({ ...cat, score: 0 }));
@@ -21,7 +21,6 @@ async function rankAndSelectCategories(categories) {
     logger.info(`开始对 ${categories.length} 个栏目进行 ${categoryRankingRounds} 轮瑞士制排名...`);
 
     for (let round = 1; round <= categoryRankingRounds; round++) {
-        // 第一轮随机分组，后续轮次按分数高低分组
         const categoriesToRank = round === 1 
             ? _.shuffle(categoriesWithScores) 
             : _.orderBy(categoriesWithScores, ['score'], ['desc']);
@@ -29,12 +28,11 @@ async function rankAndSelectCategories(categories) {
         const groups = _.chunk(categoriesToRank, categoryRankingGroupSize);
 
         const rankingPromises = groups.map(group => limit(async () => {
-            if (group.length < 2) { // 如果小组内少于2个，则不进行比较
+            if (group.length < 2) {
                 if (group.length === 1) {
-                    // 对于只有一个成员的小组，可以给予一个基础的“参与分”
                     const targetCategory = categoriesWithScores.find(c => c.url === group[0].url);
                     if (targetCategory && categoryRankingPoints.length > 1) {
-                        targetCategory.score += categoryRankingPoints[1]; // 比如给予第二名的分数
+                        targetCategory.score += categoryRankingPoints[1];
                     }
                 }
                 return;
@@ -42,24 +40,46 @@ async function rankAndSelectCategories(categories) {
             try {
                 const groupTitlesAndLinks = group.map(cat => ({title: cat.title, link: cat.url}));
                 const { system, user } = CONFIG.prompts.rankCategories(groupTitlesAndLinks, CONFIG.taskDescription);
-                const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
+                
+                // --- 新增: LLM 调用重试逻辑 ---
+                let responseText = '';
+                let rankedIndices = [];
+                let isSuccess = false;
+                const maxRetries = llmRetries || 3;
 
-                const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
+                for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                    responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
+                    const parsedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
 
-                // 确保LLM返回的索引数量和小组大小匹配，如果不匹配则跳过，防止出错
-                if (rankedIndices.length !== group.length) {
-                    logger.warn('栏目排名返回的索引数量与小组规模不匹配，跳过此小组。', {
+                    if (parsedIndices.length === group.length) {
+                        rankedIndices = parsedIndices;
+                        isSuccess = true;
+                        break; // 成功，退出重试循环
+                    }
+
+                    logger.warn(`栏目排名返回索引不匹配 (第 ${attempt}/${maxRetries} 次尝试)，准备重试...`, {
                         expected: group.length,
-                        received: rankedIndices.length,
+                        received: parsedIndices.length,
                         response: responseText,
                     });
-                    return;
+
+                    if (attempt < maxRetries) {
+                        await delay(retryDelay || 1000); // 在重试前等待
+                    }
                 }
+
+                if (!isSuccess) {
+                    logger.error(`栏目排名重试 ${maxRetries} 次后仍失败，跳过此小组。`, {
+                        expected: group.length,
+                        finalResponse: responseText,
+                    });
+                    return; // 所有重试失败后，跳过该小组
+                }
+                // --- 重试逻辑结束 ---
 
                 rankedIndices.forEach((originalIndex, rank) => {
                     const categoryInGroup = group[originalIndex];
                     if (categoryInGroup && categoryRankingPoints[rank] !== undefined) {
-                        // 找到主列表中的对象并更新分数
                         const targetCategory = categoriesWithScores.find(c => c.url === categoryInGroup.url);
                         if (targetCategory) {
                             targetCategory.score += categoryRankingPoints[rank];
@@ -168,8 +188,8 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     let articleLinks = Array.from(allFoundLinks.values()).map(link => ({ ...link, score: 0 }));
     if (articleLinks.length === 0) return [];
 
-    // --- 资格赛 (瑞士制) ---
-    const { qualificationRounds, qualificationGroupSize, qualificationPoints, qualificationConcurrency } = CONFIG.ranking;
+ // --- 资格赛 (瑞士制) ---
+    const { qualificationRounds, qualificationGroupSize, qualificationPoints, qualificationConcurrency, llmRetries, retryDelay } = CONFIG.ranking;
     const totalComparisons = qualificationRounds * Math.ceil(articleLinks.length / qualificationGroupSize);
     progressBar.start(totalComparisons, 0, { status: "资格赛 - 初始化..." });
 
@@ -186,18 +206,42 @@ export async function discoverAndRankContenders(spinner, progressBar) {
             try {
                 const groupTitles = group.map(link => link.title);
                 const { system, user } = CONFIG.prompts.qualifyLinks(groupTitles, CONFIG.taskDescription);
-                const responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
 
-                const rankedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
-                
-                if (rankedIndices.length !== group.length) {
-                    logger.warn('文章资格赛排名返回的索引数量与小组规模不匹配，跳过此小组。', {
+                // --- 新增: LLM 调用重试逻辑 ---
+                let responseText = '';
+                let rankedIndices = [];
+                let isSuccess = false;
+                const maxRetries = llmRetries || 3;
+
+                for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                    responseText = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.2);
+                    const parsedIndices = responseText.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
+
+                    if (parsedIndices.length === group.length) {
+                        rankedIndices = parsedIndices;
+                        isSuccess = true;
+                        break; // 成功，退出重试循环
+                    }
+
+                    logger.warn(`文章资格赛返回索引不匹配 (第 ${attempt}/${maxRetries} 次尝试)，准备重试...`, {
                         expected: group.length,
-                        received: rankedIndices.length,
+                        received: parsedIndices.length,
                         response: responseText,
                     });
-                    return;
+                    
+                    if (attempt < maxRetries) {
+                        await delay(retryDelay || 1000); // 在重试前等待
+                    }
                 }
+
+                if (!isSuccess) {
+                    logger.error(`文章资格赛重试 ${maxRetries} 次后仍失败，跳过此小组。`, {
+                        expected: group.length,
+                        finalResponse: responseText,
+                    });
+                    return; // 所有重试失败后，跳过该小组
+                }
+                // --- 重试逻辑结束 ---
 
                 rankedIndices.forEach((originalIndex, rank) => {
                     const articleInGroup = group[originalIndex];
