@@ -21,8 +21,8 @@ async function rankAndSelectCategories(categories) {
     logger.info(`开始对 ${categories.length} 个栏目进行 ${categoryRankingRounds} 轮瑞士制排名...`);
 
     for (let round = 1; round <= categoryRankingRounds; round++) {
-        const categoriesToRank = round === 1 
-            ? _.shuffle(categoriesWithScores) 
+        const categoriesToRank = round === 1
+            ? _.shuffle(categoriesWithScores)
             : _.orderBy(categoriesWithScores, ['score'], ['desc']);
 
         const groups = _.chunk(categoriesToRank, categoryRankingGroupSize);
@@ -38,9 +38,9 @@ async function rankAndSelectCategories(categories) {
                 return;
             }
             try {
-                const groupTitlesAndLinks = group.map(cat => ({title: cat.title, link: cat.url}));
+                const groupTitlesAndLinks = group.map(cat => ({ title: cat.title, link: cat.url }));
                 const { system, user } = CONFIG.prompts.rankCategories(groupTitlesAndLinks, CONFIG.taskDescription);
-                
+
                 // --- 新增: LLM 调用重试逻辑 ---
                 let responseText = '';
                 let rankedIndices = [];
@@ -128,18 +128,22 @@ export async function discoverAndRankContenders(spinner, progressBar) {
 
             for (const el of linkElements) {
                 const linkUrl = $(el).attr('href');
-                const linkTitle = $(el).text().trim().replace(/\s+/g, ' ');
+                const domain = baseUrl.split('://')[1]?.split('/')[0].replace('www.', '');
 
+                const linkTitle = $(el).text().trim().replace(/\s+/g, ' ');
                 if (linkUrl && linkTitle && linkTitle.length > 4 && !CONFIG.crawling.uselessTitleKeywords.some(kw => linkTitle.includes(kw))) {
                     try {
                         const absoluteUrl = new URL(linkUrl, baseUrl).href;
+                        if (!absoluteUrl.split('://')[1]?.split('/')[0].includes(domain)) {
+                            continue;
+                        }
                         const urlObject = new URL(absoluteUrl);
                         const canonicalUrl = `${urlObject.protocol}//${urlObject.hostname}${urlObject.pathname}`;
 
                         if ((urlObject.protocol === 'http:' || urlObject.protocol === 'https:') &&
                             !urlObject.pathname.match(/\.(pdf|zip|jpg|png|gif|css|js|mp3|mp4|xml|ico)$/i) &&
                             !visitedUrls.has(canonicalUrl)) {
-                            
+
                             visitedUrls.add(canonicalUrl);
                             const { system, user } = CONFIG.prompts.classifyLinkType(linkTitle, linkUrl);
                             const type = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], 0.1);
@@ -162,13 +166,13 @@ export async function discoverAndRankContenders(spinner, progressBar) {
             if (newCategoryPages.length > 0) {
                 if (newCategoryPages.length > CONFIG.crawling.maxCategoriesToExplore) {
                     spinner.text = `[${pagesExplored}] [深度 ${currentPage.depth}] 发现 ${newCategoryPages.length} 个新栏目，正在进行重要性排名...`;
-                    
+
                     const rankedCategories = await rankAndSelectCategories(newCategoryPages);
                     const topCategories = rankedCategories.slice(0, CONFIG.crawling.maxCategoriesToExplore);
-                    
+
                     spinner.text = `[${pagesExplored}] [深度 ${currentPage.depth}] 排名完成，选出 ${topCategories.length} 个重要栏目继续探索。`;
                     logger.info(`在深度 ${currentPage.depth}，从 ${newCategoryPages.length} 个栏目中选出最重要的 ${topCategories.length} 个进行下一步探索。`);
-                    
+
                     const pagesToAdd = topCategories.map(p => ({ url: p.url, depth: currentPage.depth + 1 }));
                     pagesToVisit.push(...pagesToAdd);
                 } else {
@@ -188,7 +192,7 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     let articleLinks = Array.from(allFoundLinks.values()).map(link => ({ ...link, score: 0 }));
     if (articleLinks.length === 0) return [];
 
- // --- 资格赛 (瑞士制) ---
+    // --- 资格赛 (瑞士制) ---
     const { qualificationRounds, qualificationGroupSize, qualificationPoints, qualificationConcurrency, llmRetries, retryDelay } = CONFIG.ranking;
     const totalComparisons = qualificationRounds * Math.ceil(articleLinks.length / qualificationGroupSize);
     progressBar.start(totalComparisons, 0, { status: "资格赛 - 初始化..." });
@@ -196,8 +200,8 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     const limit = pLimit(qualificationConcurrency);
 
     for (let round = 1; round <= qualificationRounds; round++) {
-        const articlesToRank = round === 1 
-            ? _.shuffle(articleLinks) 
+        const articlesToRank = round === 1
+            ? _.shuffle(articleLinks)
             : _.orderBy(articleLinks, ['score'], ['desc']);
 
         const groups = _.chunk(articlesToRank, qualificationGroupSize);
@@ -228,7 +232,7 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                         received: parsedIndices.length,
                         response: responseText,
                     });
-                    
+
                     if (attempt < maxRetries) {
                         await delay(retryDelay || 1000); // 在重试前等待
                     }
@@ -262,15 +266,15 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     }
 
     progressBar.stop();
-    
+
     const finalRankedLinks = _.orderBy(articleLinks, ['score'], ['desc']);
     const contenders = finalRankedLinks.slice(0, CONFIG.ranking.contendersToRank);
-    
+
     logger.info(`资格赛完成，根据 ${qualificationRounds} 轮积分，选出 ${contenders.length} 位决赛选手。`);
 
     if (contenders.length > 0) {
         console.log(chalk.cyan.bold(`\n✅ 资格赛完成! ${contenders.length} 篇文章晋级决赛圈.`));
     }
-    
+
     return contenders;
 }

@@ -53,14 +53,17 @@ function robustParseLLMResponse(llmResponse) {
  * @param {object} articleContent - 包含内容和原始标题的对象
  * @returns {Promise<object>} - 处理后的数据
  */
-async function processArticleWithLLM(articleContent, originalTitle, isCluster) {
+async function processArticleWithLLM(articleContent, originalTitle, isCluster, latestDate) {
     logger.debug(`开始处理议题: 《${originalTitle}》`);
-    const { system, user } = CONFIG.prompts.processArticleSingleCall(articleContent, originalTitle, isCluster);
+    const { system, user } = CONFIG.prompts.processArticleSingleCall(articleContent, originalTitle, isCluster, latestDate);
     const llmResponse = await callLLM(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
         0.5,
         CONFIG.llm.longRequestTimeout
     );
+    if (llmResponse.includes('false')) {
+        throw new Error('当前文章不是近期内容')
+    }
 
     let processedData;
     try {
@@ -126,7 +129,7 @@ export async function attemptToProcessArticle(articleMeta, rankIndex, dailyOutpu
             if (contentCount === 0) throw new Error('所有源文章的正文内容均过短, 已跳过');
 
             // 2. 调用LLM进行深度处理
-            const processedData = await processArticleWithLLM(combinedContent, articleMeta.title, isCluster);
+            const processedData = await processArticleWithLLM(combinedContent, articleMeta.title, isCluster, latestDate);
 
             // 3. 计算新颖度加分和最终得分
             let recencyBonus = 0;
