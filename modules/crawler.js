@@ -7,15 +7,18 @@ import CONFIG from '../config.js';
 import logger from '../utils/logger.js';
 import { fetchAndParsePage, callLLM } from '../services/network.js';
 
+// 优化点：修复了之前代码中调用但未定义的 delay 函数的Bug。
+const delay = ms => new Promise(res => setTimeout(res, ms));
+
 /**
  * (已重构) 通过多轮瑞士制对发现的栏目链接进行排名，选出最重要的栏目。
  * @param {Array<object>} categories - 栏目链接对象列表
  * @returns {Promise<Array<object>>} - 按重要性得分排序后的栏目列表
  */
 async function rankAndSelectCategories(categories) {
+    // 此函数配置独立在 crawling 中，保持不变
     const { categoryRankingRounds, categoryRankingGroupSize, categoryRankingPoints, llmRetries, retryDelay } = CONFIG.crawling;
-    // 复用资格赛的并发设置
-    const limit = pLimit(CONFIG.ranking.qualificationConcurrency);
+    const limit = pLimit(CONFIG.ranking.qualification.concurrency); // 复用资格赛的并发设置
     let categoriesWithScores = categories.map(cat => ({ ...cat, score: 0 }));
 
     logger.info(`开始对 ${categories.length} 个栏目进行 ${categoryRankingRounds} 轮瑞士制排名...`);
@@ -41,7 +44,6 @@ async function rankAndSelectCategories(categories) {
                 const groupTitlesAndLinks = group.map(cat => ({ title: cat.title, link: cat.url }));
                 const { system, user } = CONFIG.prompts.rankCategories(groupTitlesAndLinks, CONFIG.taskDescription);
 
-                // --- 新增: LLM 调用重试逻辑 ---
                 let responseText = '';
                 let rankedIndices = [];
                 let isSuccess = false;
@@ -54,7 +56,7 @@ async function rankAndSelectCategories(categories) {
                     if (parsedIndices.length === group.length) {
                         rankedIndices = parsedIndices;
                         isSuccess = true;
-                        break; // 成功，退出重试循环
+                        break;
                     }
 
                     logger.warn(`栏目排名返回索引不匹配 (第 ${attempt}/${maxRetries} 次尝试)，准备重试...`, {
@@ -64,7 +66,7 @@ async function rankAndSelectCategories(categories) {
                     });
 
                     if (attempt < maxRetries) {
-                        await delay(retryDelay || 1000); // 在重试前等待
+                        await delay(retryDelay || 1000);
                     }
                 }
 
@@ -73,9 +75,8 @@ async function rankAndSelectCategories(categories) {
                         expected: group.length,
                         finalResponse: responseText,
                     });
-                    return; // 所有重试失败后，跳过该小组
+                    return;
                 }
-                // --- 重试逻辑结束 ---
 
                 rankedIndices.forEach((originalIndex, rank) => {
                     const categoryInGroup = group[originalIndex];
@@ -151,7 +152,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                             if (type.includes('article')) {
                                 allFoundLinks.set(canonicalUrl, { url: canonicalUrl, title: linkTitle, type: 'article' });
                             } else if (type.includes('category') && currentPage.depth < CONFIG.crawling.maxDepth) {
-                                // 使用去重后的栏目URL作为唯一标识
                                 const existingCategory = newCategoryPages.find(p => p.url === canonicalUrl);
                                 if (!existingCategory) {
                                     newCategoryPages.push({ url: canonicalUrl, title: linkTitle, type: 'category' });
@@ -162,7 +162,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                 }
             }
 
-            // **核心修改**: 对发现的新栏目进行排名，并选择最重要的进行下一步探索
             if (newCategoryPages.length > 0) {
                 if (newCategoryPages.length > CONFIG.crawling.maxCategoriesToExplore) {
                     spinner.text = `[${pagesExplored}] [深度 ${currentPage.depth}] 发现 ${newCategoryPages.length} 个新栏目，正在进行重要性排名...`;
@@ -176,7 +175,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                     const pagesToAdd = topCategories.map(p => ({ url: p.url, depth: currentPage.depth + 1 }));
                     pagesToVisit.push(...pagesToAdd);
                 } else {
-                    // 如果发现的栏目数量不足配置的最大探索数，则全部加入
                     const pagesToAdd = newCategoryPages.map(p => ({ url: p.url, depth: currentPage.depth + 1 }));
                     pagesToVisit.push(...pagesToAdd);
                 }
@@ -193,7 +191,16 @@ export async function discoverAndRankContenders(spinner, progressBar) {
     if (articleLinks.length === 0) return [];
 
     // --- 资格赛 (瑞士制) ---
-    const { qualificationRounds, qualificationGroupSize, qualificationPoints, qualificationConcurrency, llmRetries, retryDelay } = CONFIG.ranking;
+    // 优化点：从重构后的 qualification 对象中解构所有相关配置，实现配置的统一管理。
+    const {
+        rounds: qualificationRounds,
+        groupSize: qualificationGroupSize,
+        points: qualificationPoints,
+        concurrency: qualificationConcurrency,
+        llmRetries,
+        retryDelay
+    } = CONFIG.ranking.qualification;
+
     const totalComparisons = qualificationRounds * Math.ceil(articleLinks.length / qualificationGroupSize);
     progressBar.start(totalComparisons, 0, { status: "资格赛 - 初始化..." });
 
@@ -211,7 +218,6 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                 const groupTitles = group.map(link => link.title);
                 const { system, user } = CONFIG.prompts.qualifyLinks(groupTitles, CONFIG.taskDescription);
 
-                // --- 新增: LLM 调用重试逻辑 ---
                 let responseText = '';
                 let rankedIndices = [];
                 let isSuccess = false;
@@ -224,7 +230,7 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                     if (parsedIndices.length === group.length) {
                         rankedIndices = parsedIndices;
                         isSuccess = true;
-                        break; // 成功，退出重试循环
+                        break;
                     }
 
                     logger.warn(`文章资格赛返回索引不匹配 (第 ${attempt}/${maxRetries} 次尝试)，准备重试...`, {
@@ -234,7 +240,7 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                     });
 
                     if (attempt < maxRetries) {
-                        await delay(retryDelay || 1000); // 在重试前等待
+                        await delay(retryDelay || 1000);
                     }
                 }
 
@@ -243,9 +249,8 @@ export async function discoverAndRankContenders(spinner, progressBar) {
                         expected: group.length,
                         finalResponse: responseText,
                     });
-                    return; // 所有重试失败后，跳过该小组
+                    return;
                 }
-                // --- 重试逻辑结束 ---
 
                 rankedIndices.forEach((originalIndex, rank) => {
                     const articleInGroup = group[originalIndex];

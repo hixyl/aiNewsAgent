@@ -39,9 +39,12 @@ export async function groupAndDeduplicateArticles(articles, progressBar) {
     if (articles.length < 2) return articles;
 
     console.log(chalk.cyan.bold('\n启动基于全局图的聚类流程 (发现关系 -> 构建图 -> 查找簇)...'));
-    // **(修改)** 从CONFIG中解构出新的重试参数
-    const { qualificationConcurrency, groupingBatchSize, groupingMaxRetries, groupingRetryDelay } = CONFIG.ranking;
-    const limit = pLimit(qualificationConcurrency);
+    
+    // (已修正) 从新的、正确的配置路径中读取参数。
+    // 旧的 qualificationConcurrency 不再存在于 CONFIG.ranking 的顶层。
+    const { groupingBatchSize, groupingMaxRetries, groupingRetryDelay } = CONFIG.ranking;
+    const { concurrency } = CONFIG.ranking.qualification; // 正确的并发数读取路径
+    const limit = pLimit(concurrency); // 使用正确的并发数值
 
     const articlesWithId = articles.map((article, index) => ({ ...article, id: index }));
     const articleMap = _.keyBy(articlesWithId, 'id');
